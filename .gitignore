@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+.svelte-kit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (if mounted locally)
+postgres_data/
+
+# User-level Claude Code / agent state — not project source
+.agents/
+.claude/
+skills-lock.json
+
+# Playwright screenshot artifacts (regenerated on demand)
+qa/artifacts/
+qa/__pycache__/
+
+# Throwaway ad-hoc screenshot scripts (prefixed with `_`)
+qa/_*.py
