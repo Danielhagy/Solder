@@ -22,6 +22,10 @@ from playwright.async_api import async_playwright, ConsoleMessage, Request, Resp
 
 BASE = "http://localhost:5173"
 API = "http://localhost:8000"
+# Builder is reached *through* an integration — a fresh canvas lives at
+# `/integrations/new`. Many tests want the Builder directly; they go to
+# BUILDER, not BASE (which is now the Dashboard).
+BUILDER = f"{BASE}/integrations/new"
 OUT = Path(__file__).parent / "artifacts"
 OUT.mkdir(exist_ok=True)
 
@@ -126,9 +130,9 @@ async def smoke_route(page: Page, path: str) -> PageResult:
 
 
 async def test_builder_add_nodes(page: Page) -> PageResult:
-    r = PageResult(url=f"{BASE}/ (builder interaction)")
+    r = PageResult(url=f"{BUILDER} (builder interaction)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(400)
 
     # Click each node template button in the sidebar via stable testid
@@ -159,9 +163,9 @@ async def test_builder_add_nodes(page: Page) -> PageResult:
 
 
 async def test_save_dialog(page: Page) -> PageResult:
-    r = PageResult(url=f"{BASE}/ (save dialog)")
+    r = PageResult(url=f"{BUILDER} (save dialog)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Click top-bar Save button (not the dialog's own Save button)
@@ -191,9 +195,9 @@ async def test_save_dialog(page: Page) -> PageResult:
 
 
 async def test_node_selection_and_edit(page: Page) -> PageResult:
-    r = PageResult(url=f"{BASE}/ (node select + edit properties)")
+    r = PageResult(url=f"{BUILDER} (node select + edit properties)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Add an API Call node
@@ -249,7 +253,7 @@ async def test_save_round_trip(page: Page) -> PageResult:
 
     r = PageResult(url="save UI → backend round-trip")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Add a node so the config isn't empty
@@ -257,8 +261,10 @@ async def test_save_round_trip(page: Page) -> PageResult:
     await page.wait_for_timeout(150)
 
     unique_name = f"QA Roundtrip {int(asyncio.get_event_loop().time())}"
-    # Type name into top-bar input
-    name_input = page.locator('input[placeholder="Integration name"]').first
+    # Type name into top-bar input. The topbar placeholder is "Untitled
+    # integration"; the Save dialog still uses "Integration name" (different
+    # input, different element).
+    name_input = page.locator('input[placeholder="Untitled integration"]').first
     await name_input.fill(unique_name)
 
     # Open Save dialog and confirm
@@ -285,9 +291,9 @@ async def test_save_round_trip(page: Page) -> PageResult:
 
 async def test_stages_layout(page: Page) -> PageResult:
     """Adding nodes via palette creates new stages; parallel drag stacks into one stage."""
-    r = PageResult(url=f"{BASE}/ (stages layout)")
+    r = PageResult(url=f"{BUILDER} (stages layout)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Clicking the palette always creates a new trailing stage.
@@ -353,9 +359,11 @@ async def test_integrations_list_and_load(page: Page) -> PageResult:
 
     await page.locator(f'[data-testid="integration-open-{created_id}"]').click()
     try:
-        await page.wait_for_url(f"{BASE}/?id={created_id}", timeout=3000)
+        await page.wait_for_url(f"{BASE}/integrations/{created_id}", timeout=3000)
     except Exception:
-        r.notes.append(f"FAIL: Open did not navigate to ?id=; current {page.url}")
+        r.notes.append(
+            f"FAIL: Open did not navigate to /integrations/<id>; current {page.url}"
+        )
         return r
 
     # Builder should hydrate: hidden marker + the transform node's preview text appears
@@ -376,9 +384,9 @@ async def test_integrations_list_and_load(page: Page) -> PageResult:
 
 async def test_parallel_via_drag(page: Page) -> PageResult:
     """Dragging a node to another stage's '+ parallel' drop zone parallelizes it."""
-    r = PageResult(url=f"{BASE}/ (parallel drag)")
+    r = PageResult(url=f"{BUILDER} (parallel drag)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Add two nodes in two stages
@@ -420,9 +428,9 @@ async def test_parallel_via_drag(page: Page) -> PageResult:
 
 
 async def test_trigger_switch(page: Page) -> PageResult:
-    r = PageResult(url=f"{BASE}/ (trigger strip)")
+    r = PageResult(url=f"{BUILDER} (trigger strip)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Default should be manual
@@ -459,9 +467,9 @@ async def test_trigger_switch(page: Page) -> PageResult:
 
 
 async def test_keyboard_shortcuts(page: Page) -> PageResult:
-    r = PageResult(url=f"{BASE}/ (keyboard shortcuts)")
+    r = PageResult(url=f"{BUILDER} (keyboard shortcuts)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Ctrl+S opens Save dialog
@@ -519,16 +527,16 @@ async def test_docs_dialog(page: Page) -> PageResult:
 
 async def test_version_history(page: Page) -> PageResult:
     """Save, edit, save again — the History modal should list both versions with summaries."""
-    r = PageResult(url=f"{BASE}/ (version history)")
+    r = PageResult(url=f"{BUILDER} (version history)")
     attach_listeners(page, r)
-    await page.goto(BASE, wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_timeout(300)
 
     # Seed a node and save once — produces v1 "Initial save."
     await page.locator(palette_selector("Transform")).first.click()
     await page.wait_for_timeout(150)
     unique_name = f"QA History {int(asyncio.get_event_loop().time())}"
-    name_input = page.locator('input[placeholder="Integration name"]').first
+    name_input = page.locator('input[placeholder="Untitled integration"]').first
     await name_input.fill(unique_name)
     await page.locator('button:has-text("Save")').first.click()
     await page.wait_for_timeout(200)
@@ -579,8 +587,15 @@ async def test_nav_links(page: Page) -> PageResult:
     r = PageResult(url="nav links")
     attach_listeners(page, r)
     await page.goto(BASE, wait_until="networkidle")
-    # Visit History first so Builder click has somewhere to navigate from
-    nav_order = [("History", "/history"), ("Docs", "/docs"), ("Builder", "/")]
+    # New shell: top nav is exactly Dashboard / Integrations / Runs / Mocks.
+    # Docs is no longer in the nav (lives in the `?` HelpMenu); Builder isn't
+    # either (reached *through* an integration).
+    nav_order = [
+        ("Integrations", "/integrations"),
+        ("Runs", "/runs"),
+        ("Mocks", "/mocks"),
+        ("Dashboard", "/"),
+    ]
     for label, expect_path in nav_order:
         await page.locator(f'nav a:has-text("{label}")').click()
         try:
@@ -595,7 +610,14 @@ async def main() -> int:
     results: list[PageResult] = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(viewport={"width": 1440, "height": 900})
+        # reduced_motion="reduce" — see qa_empty_drop.py for full rationale.
+        # Suppresses EmberCanvas rAF + solderNodeIn mount springs so
+        # Playwright actionability/stability checks land on dropzones,
+        # palette items, and node cards without timing out.
+        ctx = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            reduced_motion="reduce",
+        )
         page = await ctx.new_page()
 
         async def run_test(fn):
@@ -603,8 +625,8 @@ async def main() -> int:
             detach_listeners(page, r)
             return r
 
-        # Phase 1: smoke
-        for path in ["/", "/history", "/docs"]:
+        # Phase 1: smoke — every top-level route plus the Builder entrypoint.
+        for path in ["/", "/integrations", "/runs", "/mocks", "/docs", "/integrations/new"]:
             results.append(await run_test(lambda p, _path=path: smoke_route(p, _path)))
 
         # Phase 2: interactions
@@ -625,9 +647,12 @@ async def main() -> int:
             results.append(await run_test(fn))
 
         # Mobile viewport screenshots
-        mobile = await browser.new_context(viewport={"width": 375, "height": 812})
+        mobile = await browser.new_context(
+            viewport={"width": 375, "height": 812},
+            reduced_motion="reduce",
+        )
         mpage = await mobile.new_page()
-        for path in ["/", "/history", "/docs"]:
+        for path in ["/", "/integrations", "/runs", "/mocks"]:
             await mpage.goto(f"{BASE}{path}", wait_until="networkidle")
             slug = path.strip("/").replace("/", "_") or "root"
             await mpage.screenshot(path=str(OUT / f"mobile_{slug}.png"), full_page=True)

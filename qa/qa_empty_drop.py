@@ -17,6 +17,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 from playwright.async_api import async_playwright
 
 BASE = "http://localhost:5173"
+# Builder is now reached *through* an integration; fresh canvas at
+# /integrations/new (BASE / is the Dashboard).
+BUILDER = f"{BASE}/integrations/new"
 OUT = Path(__file__).parent / "artifacts" / "emptydrop"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -55,7 +58,15 @@ async def main() -> int:
     findings: list[str] = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1440, "height": 900})
+        # reduced_motion="reduce" trips the EmberCanvas rAF gate + the
+        # solderNodeIn keyframe gate so Playwright's actionability checks
+        # aren't fighting the perpetual canvas + mount-spring motion.
+        # Without it, wait_for_selector on dropzone targets times out
+        # even when the element resolves to "visible".
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            reduced_motion="reduce",
+        )
         page = await context.new_page()
         errors: list[str] = []
         page.on(
@@ -66,7 +77,7 @@ async def main() -> int:
         )
 
         print("\n[1] Empty canvas → drop API Call on the start dropzone")
-        await page.goto(f"{BASE}/", wait_until="networkidle")
+        await page.goto(BUILDER, wait_until="networkidle")
         await page.wait_for_selector('[data-testid="empty-canvas-dropzone"]', timeout=5000)
         await page.screenshot(path=str(OUT / "01_empty_with_dropzone.png"))
 
@@ -85,16 +96,20 @@ async def main() -> int:
 
         print("\n[2] Step into a Loop's empty BODY → drop on branch dropzone")
         # Fresh canvas
-        await page.goto(f"{BASE}/", wait_until="networkidle")
+        await page.goto(BUILDER, wait_until="networkidle")
         await page.wait_for_timeout(300)
         # Click the Loop in palette to add at root
         await page.click('[data-testid="palette-logic-loop"]')
         await page.wait_for_timeout(300)
-        # Step into the Loop via the compact branch row
+        # Step into the Loop via the compact branch row. NOTE: as of the
+        # in-flight builder-design-pass session, the floating-chrome overlay
+        # intercepts clicks on branch-header buttons. Tracked in HANDOFF.md
+        # — this assertion will start passing again when that design pass
+        # lands its pointer-events fix.
         step_btn = page.locator('[data-testid^="branch-header-"]').first
         await step_btn.click()
-        await page.wait_for_timeout(500)
-        # Should land in the empty BODY view with its own dropzone
+        await page.wait_for_timeout(700)
+        await page.wait_for_selector('[data-testid="nested-context-panel"]', timeout=5000)
         await page.wait_for_selector('[data-testid="empty-canvas-dropzone"]', timeout=5000)
         await page.screenshot(path=str(OUT / "03_inside_empty_loop_body.png"))
         await drag_palette_to(

@@ -22,6 +22,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 from playwright.async_api import async_playwright, Page
 
 BASE = "http://localhost:5173"
+# Builder is reached *through* an integration; fresh canvas at /integrations/new.
+BUILDER = f"{BASE}/integrations/new"
 OUT = Path(__file__).parent / "artifacts" / "zoom"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -44,7 +46,16 @@ async def capture_frames(page: Page, prefix: str, count: int, interval_ms: int) 
 async def main() -> int:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1440, "height": 900})
+        # See qa_empty_drop.py — reduced_motion="reduce" disables the
+        # EmberCanvas rAF + solderNodeIn keyframes so Playwright stability
+        # checks land. The framer-motion scene-zoom variants already
+        # honour useReducedMotion(), which means under this flag the
+        # exit/enter transitions become a fast cross-fade — fine for
+        # functional testing, no longer the >500 ms long-task burner.
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            reduced_motion="reduce",
+        )
         page = await context.new_page()
 
         errors: list[str] = []
@@ -60,7 +71,7 @@ async def main() -> int:
 
         try:
             print("\n=== STEP 1 ===  Navigate, drop a Loop container")
-            await page.goto(f"{BASE}/", wait_until="networkidle")
+            await page.goto(BUILDER, wait_until="networkidle")
             await page.wait_for_selector('[data-testid="palette-logic-loop"]', timeout=5000)
             await page.click('[data-testid="palette-logic-loop"]')
             await page.wait_for_timeout(300)
@@ -87,16 +98,18 @@ async def main() -> int:
             elapsed = time.monotonic() - t0
             print(f"  Click → settle captured in {elapsed:.2f}s")
 
-            # Verify we're inside the loop: breadcrumb + empty-branch hint
-            crumb = page.locator('[data-testid="canvas-breadcrumb"]')
+            # Verify we're inside the loop. The in-canvas breadcrumb was
+            # removed in the builder-design-pass; NestedContextPanel in the
+            # sidebar is the new step-into indicator.
+            crumb = page.locator('[data-testid="nested-context-panel"]')
             if await crumb.count() == 0:
-                findings.append("no canvas-breadcrumb after step-into")
+                findings.append("no nested-context-panel after step-into")
             else:
                 crumb_text = (await crumb.text_content()) or ""
                 if "BODY" not in crumb_text.upper() and "LOOP" not in crumb_text.upper():
-                    findings.append(f"breadcrumb missing expected labels: {crumb_text!r}")
+                    findings.append(f"context panel missing expected labels: {crumb_text!r}")
                 else:
-                    print(f"  OK: breadcrumb reads {crumb_text.strip()!r}")
+                    print(f"  OK: context panel reads {crumb_text.strip()[:60]!r}")
 
             await page.wait_for_timeout(400)
             await shot(page, "03_inside_loop_body")
@@ -111,13 +124,13 @@ async def main() -> int:
             print("\n=== STEP 4 ===  Press Esc to pop out, capture frames")
             await page.keyboard.press("Escape")
             await capture_frames(page, "04_popout", count=8, interval_ms=50)
-            crumb_count = await page.locator('[data-testid="canvas-breadcrumb"]').count()
+            crumb_count = await page.locator('[data-testid="nested-context-panel"]').count()
             if crumb_count != 0:
                 findings.append(
-                    f"breadcrumb should be gone after esc, still {crumb_count} visible"
+                    f"nested-context-panel should be gone after esc, still {crumb_count} visible"
                 )
             else:
-                print("  OK: breadcrumb gone after pop")
+                print("  OK: nested-context-panel gone after pop")
             await shot(page, "05_popped_out")
 
             print("\n=== STEP 5 ===  Rapid step-into + pop stress test")
@@ -150,7 +163,7 @@ async def main() -> int:
                 await branch_hdr.click()
                 await capture_frames(page, "07_branchhdr", count=8, interval_ms=50)
                 crumb_text = (
-                    (await page.locator('[data-testid="canvas-breadcrumb"]').text_content())
+                    (await page.locator('[data-testid="nested-context-panel"]').text_content())
                     or ""
                 )
                 if "BODY" not in crumb_text.upper():

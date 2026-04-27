@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { motion } from 'framer-motion';
 import { api, type Integration, type Run } from '@/api/client';
 import { IntegrationRowSkeleton } from '@/components/Skeleton';
 import PageHeader from '@/components/PageHeader';
@@ -107,7 +108,7 @@ export default function Integrations() {
   }
 
   function handleOpen(id: string) {
-    navigate(`/?id=${id}`);
+    navigate(`/integrations/${id}`);
   }
 
   function selectIntegration(id: string) {
@@ -147,7 +148,7 @@ export default function Integrations() {
         title="Integrations"
         description="Standalone flows and reusable subprocesses. Pick a row to inspect; open in the Builder to edit."
         action={
-          <Link to="/" className="btn btn-primary">
+          <Link to="/integrations/new" className="btn btn-primary">
             New Integration
           </Link>
         }
@@ -195,8 +196,8 @@ export default function Integrations() {
           title="No integrations yet"
           description="Build your first integration on the canvas. Solder wires up nodes, connections and triggers into a durable workflow."
           action={
-            <Link to="/" className="btn btn-primary">
-              Open Builder
+            <Link to="/integrations/new" className="btn btn-primary">
+              New Integration
             </Link>
           }
         />
@@ -209,10 +210,11 @@ export default function Integrations() {
               caption="standalone integrations"
               empty="No standalone integrations yet."
             >
-              {main.map((i) => (
+              {main.map((i, idx) => (
                 <IntegrationRow
                   key={i.id}
                   integration={i}
+                  index={idx}
                   selected={selectedId === i.id}
                   onSelect={() => selectIntegration(i.id)}
                   onOpen={() => handleOpen(i.id)}
@@ -226,10 +228,11 @@ export default function Integrations() {
               caption="reusable subprocesses"
               empty='No subprocesses yet. Save an integration with the "Reusable subprocess" toggle on to make it callable from other integrations.'
             >
-              {library.map((i) => (
+              {library.map((i, idx) => (
                 <IntegrationRow
                   key={i.id}
                   integration={i}
+                  index={idx}
                   selected={selectedId === i.id}
                   onSelect={() => selectIntegration(i.id)}
                   onOpen={() => handleOpen(i.id)}
@@ -300,6 +303,12 @@ interface IntegrationRowProps {
   onSelect: () => void;
   onOpen: () => void;
   onDelete: () => void;
+  /**
+   * Index within the rendered list. Drives the per-row stagger delay
+   * so the list fans in top-to-bottom on mount — same pattern Dashboard
+   * uses on its OPERATING strip, applied here for consistency.
+   */
+  index?: number;
 }
 
 function IntegrationRow({
@@ -307,7 +316,8 @@ function IntegrationRow({
   selected,
   onSelect,
   onOpen,
-  onDelete
+  onDelete,
+  index = 0
 }: IntegrationRowProps) {
   const nodeCount = integration.config?.nodes?.length ?? 0;
   const triggerType = integration.trigger?.type ?? 'manual';
@@ -315,7 +325,7 @@ function IntegrationRow({
   const isDeleted =
     integration.status === 'disabled' || integration.is_active === false;
   return (
-    <div
+    <motion.div
       role="button"
       tabIndex={0}
       data-testid={`integration-row-${integration.id}`}
@@ -326,6 +336,9 @@ function IntegrationRow({
           onSelect();
         }
       }}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18, ease: 'easeOut', delay: 0.03 * index }}
       className={`card p-4 flex items-center justify-between gap-4 cursor-pointer transition-shadow hover:shadow-md ${
         selected ? 'ring-1 ring-primary-400 dark:ring-primary-500/60' : ''
       } ${isDeleted ? 'opacity-60' : ''}`}
@@ -381,7 +394,7 @@ function IntegrationRow({
           ✕
         </button>
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -481,7 +494,7 @@ function DetailPane({ integration, runs, runsLoading, onOpen, onDelete }: Detail
                 className="flex items-center justify-between gap-2 text-sm"
               >
                 <Link
-                  to={`/history?integration_id=${integration.id}`}
+                  to={`/runs?integration_id=${integration.id}`}
                   className="font-mono text-xs text-surface-500 dark:text-surface-400 hover:text-primary-600 dark:hover:text-primary-400 tabular-nums"
                   title={new Date(run.created_at).toLocaleString()}
                 >
@@ -499,7 +512,7 @@ function DetailPane({ integration, runs, runsLoading, onOpen, onDelete }: Detail
         )}
         {runs.length > 0 && (
           <Link
-            to={`/history?integration_id=${integration.id}`}
+            to={`/runs?integration_id=${integration.id}`}
             className="block mt-3 text-xs font-mono uppercase tracking-[0.15em] text-primary-600 dark:text-primary-400 hover:underline"
           >
             see all runs ↗

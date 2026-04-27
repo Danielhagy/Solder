@@ -3,15 +3,27 @@ from typing import Any, Optional
 
 from anthropic import Anthropic
 
+from app.agents import OPUS, SONNET
 from app.config import settings
 
 
 class IntegrationAgent:
-    """AI agent for building and testing integrations using Claude."""
+    """AI agent for building and testing integrations using Claude.
+
+    Per FullSpec.md § 7, reasoning-heavy phases (intent capture, mapping)
+    use Opus 4.7; high-volume / low-stakes phases (field classification,
+    error explanation) use Sonnet 4.6. The class default is Opus because
+    `build_integration` is the historical "translate user intent into a
+    flow" entrypoint — that's reasoning work. Phase-specific helpers in
+    `app/agents/*.py` will pick their own model.
+    """
 
     def __init__(self):
         self.client = Anthropic(api_key=settings.anthropic_api_key)
-        self.model = "claude-sonnet-4-20250514"
+        self.model = OPUS
+        # Stash the high-volume model so callers can swap when appropriate
+        # without re-importing the constants module.
+        self.fast_model = SONNET
 
     async def build_integration(
         self,
@@ -80,12 +92,13 @@ Always respond with valid JSON containing:
             messages=[{"role": "user", "content": user_message}],
         )
 
-        # Parse the response
+        # TODO(slice 5/6): replace this brittle brace-extraction path with
+        # Claude tool use / structured output (FullSpec.md § 11). Kept here
+        # so the existing /api/agents endpoints don't break before the new
+        # phases land; the new agents in app/agents/*.py will use tool use
+        # from the start.
         response_text = response.content[0].text
-
-        # Try to extract JSON from the response
         try:
-            # Find JSON in the response
             start = response_text.find("{")
             end = response_text.rfind("}") + 1
             if start != -1 and end > start:

@@ -51,6 +51,34 @@ class Integration(Base, TimestampMixin):
         default=False, server_default="false", nullable=False
     )
 
+    # ── v1 mock-engine + connector wiring (Slice 2.5) ──
+    #
+    # Connections are bound via the `integration_connections` join table
+    # (N per integration, alias-keyed). The pre-2.5 binary
+    # source/target connector + credential FKs were dropped in
+    # favour of that model — direction is read off canvas wiring, not
+    # the schema.
+    # 'sandbox' (mock-engine) | 'production' (real APIs). Defaults to sandbox
+    # so a fresh integration is always safe to run.
+    environment: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sandbox", server_default=text("'sandbox'")
+    )
+    # Captured during intent-capture (agent phase 3, spec § 7.3). Free-form
+    # human-readable summary the AI restates to the user. Empty until phase 3
+    # runs.
+    intent_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 'pending' | 'running' | 'complete' | 'failed'. Drives the IntegrationCreate
+    # flow's progress display.
+    discovery_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default=text("'pending'")
+    )
+    # Optional pointer to the latest mock spec. The pre-2.5
+    # `source_test_bank_id` / `target_test_bank_id` columns were dropped in
+    # Slice 2.5 — banks are walked from `integration_connections` instead.
+    mock_spec_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("mock_specs.id"), nullable=True
+    )
+
     # Relationships
     runs: Mapped[list["Run"]] = relationship(back_populates="integration")
     openapi_specs: Mapped[list["OpenAPISpec"]] = relationship(

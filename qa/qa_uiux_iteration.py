@@ -24,6 +24,9 @@ from playwright.async_api import async_playwright, Page
 
 BASE = "http://localhost:5173"
 API = "http://localhost:8000"
+# Builder is reached *through* an integration — fresh canvas at
+# /integrations/new. BASE / now lands on the Dashboard.
+BUILDER = f"{BASE}/integrations/new"
 OUT = Path(__file__).parent / "artifacts" / "iteration"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -49,7 +52,7 @@ async def shot(page: Page, name: str) -> None:
 
 async def section_save_status(page: Page) -> None:
     print("\n[1] save-status indicator")
-    await page.goto(f"{BASE}/", wait_until="networkidle")
+    await page.goto(BUILDER, wait_until="networkidle")
     await page.wait_for_selector('[data-testid="save-status"]', timeout=8000)
     await shot(page, "01_pristine")
 
@@ -60,8 +63,8 @@ async def section_save_status(page: Page) -> None:
     else:
         fail(f"pristine data-dirty={dirty!r} (want false)")
 
-    # Rename triggers dirty
-    name_input = page.locator('input[placeholder="Integration name"]')
+    # Rename triggers dirty (topbar input — Save dialog uses "Integration name")
+    name_input = page.locator('input[placeholder="Untitled integration"]')
     await name_input.fill("Iteration QA Test")
     await page.wait_for_timeout(300)
     dirty = await page.get_attribute('[data-testid="save-status"]', "data-dirty")
@@ -157,8 +160,8 @@ async def section_integrations_filter(page: Page) -> None:
 
 async def section_run_drawer(page: Page) -> None:
     print("\n[4] live run drawer")
-    # Return to Builder with the saved integration; add another node for shape
-    await page.goto(f"{BASE}/", wait_until="networkidle")
+    # Return to Builder with a fresh canvas; add nodes for the run plan.
+    await page.goto(BUILDER, wait_until="networkidle")
     # Ensure manual trigger so Run is enabled
     await page.click('[data-testid="trigger-pill-manual"]')
     await page.wait_for_timeout(150)
@@ -218,7 +221,7 @@ async def section_skeletons(page: Page) -> None:
     try:
         for route, tid in [
             ("/integrations", "integrations-skeleton"),
-            ("/history", "runs-skeleton"),
+            ("/runs", "runs-skeleton"),
             ("/docs", "specs-skeleton"),
         ]:
             nav = asyncio.create_task(page.goto(f"{BASE}{route}", wait_until="domcontentloaded"))
@@ -289,7 +292,13 @@ async def section_docs_markdown(page: Page) -> None:
 async def main() -> int:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1440, "height": 900})
+        # reduced_motion="reduce" — see qa_empty_drop.py. Suppresses the
+        # EmberCanvas rAF and solderNodeIn keyframes so Playwright
+        # actionability checks aren't fighting perpetual motion.
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            reduced_motion="reduce",
+        )
         page = await context.new_page()
         console_errors: list[str] = []
         page.on(

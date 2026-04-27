@@ -5,8 +5,51 @@ import {
   groupByStage,
   type SolderNode
 } from '@/stores/integration';
-import { CATALOG, lookupCatalog, nodeKey, isContainerKind } from '@/catalog';
+import {
+  CATALOG,
+  branchCaption,
+  containerHeadline,
+  defaultContainerLabel,
+  isContainerKind,
+  loopReduceCaption,
+  lookupCatalog,
+  nodeKey,
+  resolveBranches
+} from '@/catalog';
 import { DND_MIME_EXISTING, DND_MIME_NEW } from './dnd';
+import TriggerCard from './TriggerCard';
+
+/**
+ * Configuration-completeness derived per node kind. Used to drive the
+ * status pip on each node card so users can scan a stage row and see
+ * "what's still empty" without opening the properties panel.
+ *
+ * `idle` is the no-information state — currently unused for new nodes
+ * (we default to `incomplete` or `ready` based on config), but reserved
+ * for future "never run" semantics once run history reaches the canvas.
+ */
+type NodeStatus = 'idle' | 'incomplete' | 'ready' | 'running' | 'success' | 'error';
+
+function deriveNodeStatus(node: SolderNode): NodeStatus {
+  const cfg = node.config;
+  switch (`${node.kind}.${node.action}`) {
+    case 'http.request':
+      return (cfg.url as string)?.trim() ? 'ready' : 'incomplete';
+    case 'transform.map':
+      return (cfg.expression as string)?.trim() ? 'ready' : 'incomplete';
+    case 'logic.branch':
+      return (cfg.expression as string)?.trim() ? 'ready' : 'incomplete';
+    case 'logic.loop':
+      return (cfg.over as string)?.trim() ? 'ready' : 'incomplete';
+    case 'process.call':
+      return (cfg.target_id as string)?.trim() ? 'ready' : 'incomplete';
+    case 'output.passthrough':
+      // Output is "ready" by default — empty mapping is a valid passthrough.
+      return 'ready';
+    default:
+      return 'idle';
+  }
+}
 
 /**
  * Returns true if the DataTransfer carries any solder DnD payload (either an
@@ -133,16 +176,41 @@ export default function StagesGraph({
   // Root gaps are wider (80px) to make the "new stage" affordance obvious;
   // nested graphs keep a tighter gap so container cards don't bloat.
   const gapMinWidth = depth > 0 ? 'min-w-[44px]' : 'min-w-[80px]';
+  const isRoot = !owner;
+  // Visual offset applied to the rendered stage label so the user's
+  // real stage 1 reads as `02` (the trigger card occupies `01`). Only
+  // applied at root — branches don't get a trigger.
+  const stageOffset = isRoot ? 1 : 0;
 
   if (stages.length === 0) {
-    // Empty graph — render a large "start here" drop target so palette drags
-    // have an obvious, generous target. Small narrow gap zones get missed on
-    // an empty canvas; a full column reads as "drop a node anywhere here".
+    // Empty graph — render a blueprint-style drop surface. Drafting-paper
+    // frame corners + measurement rule deploy the otherwise-unused
+    // `.frame-corners` / `.measure-rule` primitives so the empty state
+    // reads as schematic ("this is where the flow gets drafted") rather
+    // than generic SaaS "click + to start".
     const tailId = `${prefix}gap-before-1`;
     const active = hotZone === tailId;
-    const isRoot = !owner;
     return (
-      <div className="flex-1 flex items-start">
+      // Outer is `relative` + `flex-1` so the empty-state copy can absolute-
+      // position to the canvas viewport's geometric center (the user wants
+      // it centered in the whole canvas, not just the slot to the right of
+      // the trigger card). The dropzone still spans the full area for d&d.
+      <div className="relative flex-1 min-h-[60vh]">
+        {isRoot && (
+          <div
+            className={`absolute top-0 left-0 z-10 flex flex-col flex-shrink-0 ${columnMinWidth} ${columnMaxWidth}`}
+          >
+            <div className="mb-3 flex items-center gap-2 px-1">
+              <span className="text-[10px] font-mono uppercase tracking-[0.2em] tabular-nums text-surface-400 dark:text-surface-500">
+                01
+              </span>
+              <span className="text-xs font-semibold uppercase tracking-wider text-surface-700 dark:text-surface-300">
+                start
+              </span>
+            </div>
+            <TriggerCard />
+          </div>
+        )}
         <div
           data-testid="empty-canvas-dropzone"
           onDragOver={allowDrop(tailId)}
@@ -150,32 +218,30 @@ export default function StagesGraph({
           onDrop={(e) =>
             onDropInto({ stage: 1, slot: 0, newStage: 'before' }, owner, e)
           }
-          className={`flex-1 min-h-[60vh] rounded-2xl border-2 border-dashed flex flex-col items-center justify-center gap-2 p-8 transition-all ${
-            active
-              ? 'border-primary-400 bg-primary-50/50 dark:border-primary-500 dark:bg-primary-500/10'
-              : 'border-surface-200/70 dark:border-surface-800/70 hover:border-surface-300 dark:hover:border-surface-700 hover:bg-surface-50/40 dark:hover:bg-surface-900/30'
+          className={`absolute inset-0 flex items-center justify-center transition-colors ${
+            active ? 'ring-2 ring-forge-500/60 bg-forge-500/[0.04] rounded-2xl' : ''
           }`}
         >
-          <span
-            className={`text-3xl leading-none transition-colors ${
-              active ? 'text-primary-500' : 'text-surface-300 dark:text-surface-700'
-            }`}
-            aria-hidden="true"
-          >
-            +
-          </span>
-          <span
-            className={`eyebrow ${
-              active ? 'text-primary-600 dark:text-primary-400' : ''
-            }`}
-          >
-            {isRoot ? 'drop to start the flow' : 'drop to start this branch'}
-          </span>
-          <span className="text-xs text-surface-500 dark:text-surface-400 max-w-xs text-center">
-            {isRoot
-              ? 'Drag a node from the palette, or click one to add.'
-              : 'Drag a node here, or click one in the palette.'}
-          </span>
+          <div className="max-w-sm flex flex-col items-center gap-3 text-center px-4">
+            <span className="eyebrow text-surface-400 dark:text-surface-500">
+              {isRoot ? 'integration · empty' : 'branch · empty'}
+            </span>
+            <h2
+              className={`font-display text-2xl font-semibold tracking-[-0.01em] transition-colors ${
+                active
+                  ? 'text-forge-400'
+                  : 'text-surface-700 dark:text-surface-200'
+              }`}
+            >
+              {isRoot ? 'Draft your first stage' : 'Draft this branch'}
+            </h2>
+            <div className="measure-rule w-40 my-1" aria-hidden="true" />
+            <p className="text-sm text-surface-500 dark:text-surface-400">
+              {isRoot
+                ? 'Trigger is set. Drop a step from the palette to add stage 02 — or click one to append it.'
+                : 'Drop a step here to populate this branch — its body will run inside the parent.'}
+            </p>
+          </div>
         </div>
       </div>
     );
@@ -183,6 +249,21 @@ export default function StagesGraph({
 
   return (
     <div className="flex items-start gap-2">
+      {/* Synthetic trigger column at root — visual stage 01. Real stages
+          shift to 02+ via `visualStageOffset` below. Branches skip this. */}
+      {isRoot && (
+        <div className={`flex flex-col flex-shrink-0 ${columnMinWidth} ${columnMaxWidth}`}>
+          <div className="mb-3 flex items-center gap-2 px-1">
+            <span className="text-[10px] font-mono uppercase tracking-[0.2em] tabular-nums text-surface-400 dark:text-surface-500">
+              01
+            </span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-surface-700 dark:text-surface-300">
+              start
+            </span>
+          </div>
+          <TriggerCard />
+        </div>
+      )}
       {/* Lead drop-zone before stage 1 */}
       <StageGap
         active={hotZone === `${prefix}gap-before-1`}
@@ -221,6 +302,7 @@ export default function StagesGraph({
               minWidthClass={columnMinWidth}
               maxWidthClass={columnMaxWidth}
               scopePrefix={prefix}
+              visualStageOffset={stageOffset}
             />
             {/* Inter-stage gap: a compact "insert stage here" zone between columns. */}
             {!isLast && (
@@ -248,7 +330,7 @@ export default function StagesGraph({
           the next stage. Replaces the old thin "new stage" gap so users drag
           to an obvious column-shaped target, not a narrow vertical strip. */}
       <PhantomSlot
-        stage={stages[stages.length - 1].stage + 1}
+        stage={stages[stages.length - 1].stage + 1 + stageOffset}
         active={hotZone === `${prefix}phantom-trailing`}
         onDragOver={allowDrop(`${prefix}phantom-trailing`)}
         onDragLeave={clearHot}
@@ -436,6 +518,11 @@ interface StageColumnProps {
   minWidthClass: string;
   maxWidthClass: string;
   scopePrefix: string;
+  /** Added to the stage's internal number when rendering its label. The
+   *  root canvas passes `1` so the synthetic trigger card occupies
+   *  visual `01` and the user's real stages start at `02`. Branches
+   *  pass `0` (default) — no trigger inside containers. */
+  visualStageOffset?: number;
 }
 
 function StageColumn({
@@ -454,8 +541,10 @@ function StageColumn({
   depth,
   minWidthClass,
   maxWidthClass,
-  scopePrefix
+  scopePrefix,
+  visualStageOffset = 0
 }: StageColumnProps) {
+  const visualStage = stage + visualStageOffset;
   const tailZoneId = `${scopePrefix}stage-${stage}-tail`;
   const columnZoneId = `${scopePrefix}stage-${stage}-column`;
   const tailHot = hotZone === tailZoneId;
@@ -527,17 +616,17 @@ function StageColumn({
       data-branch-stage-testid={branchTestId}
       data-drop-candidate={columnCandidate ? 'true' : undefined}
     >
-      {/* Header */}
+      {/* Header — `visualStage` reflects the offset applied at root for
+          the synthetic trigger card. `stage` (internal) stays 1-indexed
+          for data-flow correctness; `visualStage` is what the user reads. */}
       <div className="mb-3 flex items-center gap-2 px-1">
         <span className="text-[10px] font-mono uppercase tracking-[0.2em] tabular-nums text-surface-400 dark:text-surface-500">
-          {String(stage).padStart(2, '0')}
+          {String(visualStage).padStart(2, '0')}
         </span>
         <span className="text-xs font-semibold uppercase tracking-wider text-surface-700 dark:text-surface-300">
-          {stage === 1
-            ? 'start'
-            : nodes.length > 1
-              ? `stage ${stage} · parallel`
-              : `stage ${stage}`}
+          {nodes.length > 1
+            ? `stage ${visualStage} · parallel`
+            : `stage ${visualStage}`}
         </span>
       </div>
 
@@ -736,10 +825,13 @@ function NodeCard({
   const catalogEntry = CATALOG.find(
     (c) => c.kind === node.kind && c.action === node.action
   );
+  // Resolve the live branches via the helper — handles dynamic kinds
+  // (Switch derives its arms from `config.cases`) so we don't have to
+  // special-case here. Treat the node as a container only when it has
+  // both the catalog category for it AND a populated branches map.
+  const branches = resolveBranches(node);
   const isContainer =
-    isContainerKind(node.kind, node.action) &&
-    !!node.branches &&
-    !!catalogEntry?.containerBranches;
+    isContainerKind(node.kind, node.action) && !!node.branches && !!branches;
   const navigate = useNavigate();
   const isProcessCall = node.kind === 'process' && node.action === 'call';
   const processTargetId =
@@ -748,13 +840,14 @@ function NodeCard({
       : '';
 
   // Containers sit at normal card size and don't expand their body inline —
-  // step-into is the only path in. Keeps the next-stage affordance adjacent
-  // and the canvas readable regardless of how deep a Loop/Branch runs.
-  // The accented left edge differentiates them from leaf nodes; without it
-  // a Loop reads identically to an API Call apart from the metadata footer.
+  // step-into is the only path in. The accented left edge differentiates
+  // containers from leaf nodes — promoted to forge so the canvas's hot
+  // metaphor carries over to the structural cue, not just sky-blue
+  // everywhere. The selection ring uses forge for the same reason.
   const containerEdgeClass = isContainer
-    ? 'border-l-[3px] border-l-primary-400 dark:border-l-primary-500/60'
+    ? 'border-l-[3px] border-l-forge-500/60 dark:border-l-forge-500/70'
     : '';
+  const status = deriveNodeStatus(node);
 
   return (
     <div
@@ -762,27 +855,67 @@ function NodeCard({
       onDragStart={onDragStart}
       data-testid={`node-${key}`}
       data-node-id={node.id}
+      data-node-status={status}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
       }}
       className={`node node-${key} group relative rounded-xl bg-white border border-surface-200 p-3 cursor-grab active:cursor-grabbing shadow-node hover:shadow-node-hover dark:bg-surface-900/90 dark:border-surface-800 dark:shadow-none dark:hover:shadow-lg dark:hover:shadow-black/40 dark:backdrop-blur-sm animate-[solderNodeIn_200ms_ease-out] ${containerEdgeClass} ${
         selected
-          ? 'ring-2 ring-primary-500 ring-offset-2 dark:ring-offset-surface-950'
+          ? 'ring-2 ring-forge-500 ring-offset-2 dark:ring-offset-surface-950'
           : ''
       }`}
     >
+      {/*
+       * The visible status pip that used to live here was removed —
+       * its dark ring (sized for visibility against the white card
+       * shadow) was reading as a "random black circle" against the
+       * glass-rail card backgrounds rather than the subtle status cue
+       * it was meant to be. The status itself is still derived and
+       * exposed via `data-node-status` on the card root above so a
+       * future indicator (forge-tinted left edge, run-time pulse, etc.)
+       * has a stable hook. The .status-pip CSS classes are preserved
+       * in index.css for that reuse.
+       */}
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 min-w-0">
+          {/*
+           * Icon is now the leftmost element. The step-number badge that
+           * used to sit before it was removed — the column header above
+           * the card already prints "01 START / 02 STAGE 2 / …", so a
+           * second copy on every card was just redundant chrome.
+           */}
           <span
             className={`inline-flex items-center justify-center h-6 w-6 rounded-md text-xs leading-none ${meta.chip}`}
             aria-hidden="true"
           >
             {meta.icon}
           </span>
-          <span className="font-medium text-sm text-surface-900 dark:text-surface-50 truncate">
-            {meta.label}
-          </span>
+          {(() => {
+            // Title resolution chain (FullSpec § 11 + roadmap promotion):
+            //   1. user-authored label (always wins)
+            //   2. derived label (containers only — read off config so the
+            //      card always reads as a sentence, never the bare kind)
+            //   3. catalog kind ("Loop", "Branch", "API Call", …)
+            // The kind-eyebrow renders alongside whenever the title is NOT
+            // the bare kind, so the user can still see what the node is.
+            const userLabel = node.label?.trim();
+            const derived = isContainer ? defaultContainerLabel(node) : null;
+            const title = userLabel || derived || meta.label;
+            const showKindEyebrow = title !== meta.label;
+            return (
+              <div className="flex items-baseline gap-1.5 min-w-0">
+                <span className="font-medium text-sm text-surface-900 dark:text-surface-50 truncate">
+                  {title}
+                </span>
+                {showKindEyebrow && (
+                  <span className="eyebrow shrink-0" aria-label="kind">
+                    {meta.label}
+                  </span>
+                )}
+              </div>
+            );
+          })()}
         </div>
         <div className="flex items-center gap-1">
           {isProcessCall && processTargetId && (
@@ -794,13 +927,13 @@ function NodeCard({
               data-testid={`jump-to-subprocess-${node.id}`}
               onClick={(e) => {
                 e.stopPropagation();
-                navigate(`/?id=${processTargetId}`);
+                navigate(`/integrations/${processTargetId}`);
               }}
             >
               ↗
             </button>
           )}
-          {isContainer && onStepInto && catalogEntry?.containerBranches && (
+          {isContainer && onStepInto && branches && branches.length > 0 && (
             <button
               type="button"
               aria-label="Step into container"
@@ -809,9 +942,10 @@ function NodeCard({
               data-testid={`step-into-${nodeKey(node.kind, node.action)}`}
               onClick={(e) => {
                 e.stopPropagation();
-                // Default target: the first branch (e.g. `true` for logic.branch,
-                // `body` for logic.loop). Users navigate deeper from there.
-                const first = catalogEntry.containerBranches![0];
+                // Default target: the first resolved branch (`true` for
+                // If/Else, `body` for Loop, the first configured `case_*`
+                // for Switch). Users navigate deeper from there.
+                const first = branches[0];
                 triggerDive(e, node.id, onPrepareDiveIn, () =>
                   onStepInto(node.id, first.key)
                 );
@@ -841,25 +975,73 @@ function NodeCard({
           </span>
         </div>
       )}
+      {/*
+       * Headline row.
+       *
+       * For containers: a kind-specific one-liner (`iterating $.items` for
+       * loops, `if $.status == "approved"` for branches, `<target> · for each
+       * <over>` for process calls). For leaf nodes: the catalog's preview
+       * function. The headline is what tells the user "what this card is
+       * actually doing" without stepping in.
+       */}
       <div className="font-mono text-xs text-surface-500 dark:text-surface-400 truncate">
-        {meta.preview(node.config)}
+        {(isContainer ? containerHeadline(node) : null) ?? meta.preview(node.config)}
       </div>
+      {(() => {
+        // Loop reduce caption — tells downstream readers what shape this
+        // loop hands off (array of outputs / count / last / nothing).
+        const cap = loopReduceCaption(node);
+        if (!cap) return null;
+        return (
+          <div className="font-mono text-[11px] text-surface-400 dark:text-surface-500 truncate mt-0.5">
+            {cap}
+          </div>
+        );
+      })()}
 
       {/*
-       * Container metadata: a compact row per branch with step count + a
-       * "step in" affordance. No inline sub-canvas — users open containers
-       * by step-into only, keeping the root card at normal node width so
-       * the "+ new stage" column sits where the eye expects it.
+       * Container body summary: the inside of a Loop / Branch / Call
+       * Subprocess at a glance.
+       *   - "3 steps · API Call · Transform" — aggregate count + ordered
+       *     kind list from across all branches, so the user never has to
+       *     step in just to read what's there.
+       *   - One row per branch: label + caption (e.g. "if $.status ==
+       *     'approved'" on the TRUE branch, "else" on FALSE) + step count.
+       * The whole region is non-draggable so the rows don't accidentally
+       * grab pointer focus from the parent card's drag affordance.
        */}
-      {isContainer && catalogEntry?.containerBranches && (
+      {isContainer && branches && (
         <div
-          className="mt-2 space-y-0.5 pt-2 border-t border-surface-200/70 dark:border-surface-800/70"
+          className="mt-2 space-y-1 pt-2 border-t border-surface-200/70 dark:border-surface-800/70"
           onClick={(e) => e.stopPropagation()}
           draggable={false}
           onDragStart={(e) => e.stopPropagation()}
         >
-          {catalogEntry.containerBranches.map((b) => {
+          {(() => {
+            const all = Object.values(node.branches ?? {}).flat() as SolderNode[];
+            if (all.length === 0) {
+              return (
+                <div className="text-[11px] font-mono text-surface-400 dark:text-surface-600 italic">
+                  empty — step in to add steps
+                </div>
+              );
+            }
+            const kinds = all.map((n) => lookupCatalog(n.kind, n.action).label);
+            return (
+              <div className="text-[11px] font-mono text-surface-500 dark:text-surface-400 flex items-center gap-1.5 min-w-0">
+                <span className="tabular-nums shrink-0">
+                  {all.length} {all.length === 1 ? 'step' : 'steps'}
+                </span>
+                <span className="text-surface-300 dark:text-surface-700 shrink-0">·</span>
+                <span className="truncate" title={kinds.join(' · ')}>
+                  {kinds.join(' · ')}
+                </span>
+              </div>
+            );
+          })()}
+          {branches.map((b) => {
             const list = node.branches?.[b.key] ?? [];
+            const caption = branchCaption(node, b.key);
             return (
               <button
                 key={b.key}
@@ -874,13 +1056,23 @@ function NodeCard({
                 disabled={!onStepInto}
                 title={onStepInto ? 'Step into this branch' : undefined}
                 data-testid={`branch-header-${node.id}-${b.key}`}
-                className="w-full flex items-center justify-between gap-2 py-1 px-1.5 -mx-1.5 rounded text-[11px] font-mono uppercase tracking-[0.15em] text-surface-500 dark:text-surface-400 hover:bg-surface-100/80 dark:hover:bg-surface-800/60 hover:text-primary-600 dark:hover:text-primary-400 transition-colors disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-surface-500"
+                className="w-full flex items-center justify-between gap-2 py-1 px-1.5 -mx-1.5 rounded text-[11px] font-mono text-surface-500 dark:text-surface-400 hover:bg-surface-100/80 dark:hover:bg-surface-800/60 hover:text-primary-600 dark:hover:text-primary-400 transition-colors disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-surface-500"
               >
-                <span className="flex items-center gap-1.5">
-                  <span className="text-surface-400 dark:text-surface-600">▸</span>
-                  <span>{b.label}</span>
+                <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                  <span className="text-surface-400 dark:text-surface-600 shrink-0">▸</span>
+                  <span className="uppercase tracking-[0.15em] shrink-0">
+                    {b.label}
+                  </span>
+                  {caption && (
+                    <span
+                      className="text-[10px] text-surface-600 dark:text-surface-300 truncate normal-case tracking-normal"
+                      title={caption}
+                    >
+                      {caption}
+                    </span>
+                  )}
                 </span>
-                <span className="flex items-center gap-1.5 text-surface-400 dark:text-surface-600">
+                <span className="flex items-center gap-1.5 text-surface-400 dark:text-surface-600 shrink-0">
                   <span className="tabular-nums">
                     {list.length} {list.length === 1 ? 'step' : 'steps'}
                   </span>

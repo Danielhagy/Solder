@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
+    # Backend self-base — workflow connector ops route sandbox traffic
+    # back through `/api/mock/...` on this host.
+    api_base_url: str = "http://localhost:8000"
+
     class Config:
         env_file = ".env"
 

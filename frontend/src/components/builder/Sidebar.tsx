@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from 'react';
 import { useIntegrationStore } from '@/stores/integration';
-import { api } from '@/api/client';
 import { GROUPS, groupedCatalog, type CatalogEntry, type NodeGroup } from '@/catalog';
+// CatalogEntry kept for the palette-drag handler's parameter type even though
+// the rail-chips that referenced it directly are gone.
 import { DND_MIME_NEW, type NewNodePayload } from './dnd';
+import NestedContextPanel from './NestedContextPanel';
+import { api, brandLogoUrl } from '@/api/client';
 
 /** CSS hook applied to <body> while a palette drag is in flight. */
 const PALETTE_DRAG_CLASS = 'palette-dragging';
@@ -12,23 +15,74 @@ export default function Sidebar() {
   const addNodeToBranchNewStage = useIntegrationStore((s) => s.addNodeToBranchNewStage);
   const focusPath = useIntegrationStore((s) => s.focusPath);
   const resetStore = useIntegrationStore((s) => s.reset);
-  const loadConfig = useIntegrationStore((s) => s.loadConfig);
 
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [aiLoading, setAiLoading] = useState(false);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const [collapsed, setCollapsed] = useState(false);
   const [query, setQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
 
+  /*
+   * Map of `connector.name` → `brand_domain` from `/api/connectors`. Used
+   * to render Brandfetch CDN logos on palette entries whose `kind`
+   * matches a registered connector (e.g. `zip.list_vendors` shows the
+   * Zip logo). Fetched once on mount; failures fall through to the
+   * generic glyph icon.
+   */
+  const [brandByKind, setBrandByKind] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const cs = await api.listConnectors();
+        if (!alive) return;
+        const map: Record<string, string> = {};
+        for (const c of cs) {
+          if (c.brand_domain) map[c.name] = c.brand_domain;
+        }
+        setBrandByKind(map);
+      } catch {
+        // Falls through to glyph rendering — no error state needed.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /*
+   * Publish the sidebar's effective width (rail + Builder root padding +
+   * gap) as a CSS variable on `<body>` so the Canvas's left padding can
+   * track us through the collapse transition. Without this, the canvas
+   * content stays pinned at the expanded position and the collapsed
+   * sidebar leaves a ~220px dead zone of empty canvas where nodes
+   * "should have moved into" — which is exactly what the user flagged.
+   *
+   * 17rem when expanded = sidebar w-64 (256px) + gap 0.5rem + root pad
+   *                       0.5rem + a small breathing buffer
+   * 5rem  when collapsed = sidebar w-12 (48px)  + the same paddings
+   */
+  useEffect(() => {
+    document.body.style.setProperty(
+      '--solder-sidebar-w',
+      collapsed ? '5rem' : '17rem'
+    );
+    return () => {
+      document.body.style.removeProperty('--solder-sidebar-w');
+    };
+  }, [collapsed]);
+
   const grouped = groupedCatalog();
-  // Sample one entry per group so the collapsed rail still hints at the catalog.
-  const railChips = GROUPS.map((g) => grouped[g][0]).filter(Boolean) as CatalogEntry[];
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return grouped;
-    const out = { HTTP: [], Data: [], Logic: [], Process: [], Output: [] } as Record<NodeGroup, CatalogEntry[]>;
+    // Built dynamically from GROUPS so a new group lands automatically — no
+    // need to update this initialiser when the catalog grows. The double-cast
+    // bridges TS's string-keyed `fromEntries` inference to the literal-keyed
+    // Record; keys are guaranteed to match by construction.
+    const out = Object.fromEntries(
+      GROUPS.map((g) => [g, [] as CatalogEntry[]])
+    ) as unknown as Record<NodeGroup, CatalogEntry[]>;
     for (const g of GROUPS) {
       for (const e of grouped[g]) {
         const hay = `${e.label} ${e.description} ${e.kind} ${e.action}`.toLowerCase();
@@ -121,86 +175,63 @@ export default function Sidebar() {
     }
   }
 
-  async function handleBuildAI() {
-    if (!aiPrompt.trim()) return;
-    setAiLoading(true);
-    try {
-      const result = await api.buildWithAI(aiPrompt);
-      if (result.integration_config) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        loadConfig(result.integration_config as any);
-      }
-    } catch (err) {
-      console.error('AI build failed:', err);
-    } finally {
-      setAiLoading(false);
-    }
-  }
-
   return (
     <aside
-      className={`relative ${
+      className={`relative pointer-events-auto ${
         collapsed ? 'w-12' : 'w-64'
-      } bg-white border-r border-surface-200 shadow-[inset_-1px_0_0_0_rgb(244_244_245)] flex flex-col transition-all duration-200 dark:bg-surface-950 dark:border-surface-800`}
+      } glass-rail rounded-xl flex flex-col transition-all duration-200`}
     >
-      {/* Collapse toggle pinned to the top-right edge */}
+      {/* Collapse toggle pinned just inside the rail's right edge. Sits on
+          the glass surface itself (the rail is rounded now, so a half-
+          outside button would clip awkwardly). */}
       <button
         type="button"
         aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         onClick={() => setCollapsed((v) => !v)}
-        className="absolute top-3 -right-3 z-10 w-6 h-6 rounded-full bg-white border border-surface-200 text-surface-500 hover:text-surface-900 hover:border-surface-300 shadow-sm flex items-center justify-center text-xs leading-none transition-colors dark:bg-surface-900 dark:border-surface-800 dark:text-surface-400 dark:hover:text-surface-50 dark:hover:border-surface-700"
+        className="absolute top-3 right-1.5 z-10 w-6 h-6 rounded-full text-surface-500 hover:text-surface-900 hover:bg-surface-100 flex items-center justify-center text-xs leading-none transition-colors dark:text-surface-400 dark:hover:text-surface-50 dark:hover:bg-white/5"
       >
         {collapsed ? '›' : '‹'}
       </button>
 
       {collapsed ? (
-        <div className="flex-1 flex flex-col items-center pt-4 gap-2">
-          {railChips.map((entry) => (
-            <span
-              key={`${entry.kind}.${entry.action}`}
-              title={entry.label}
-              className={`inline-flex items-center justify-center w-7 h-7 rounded-md text-sm ring-1 ${entry.chip}`}
-            >
-              {entry.icon}
-            </span>
-          ))}
-          <div className="mt-auto mb-3">
-            <span className="text-[9px] font-mono uppercase tracking-[0.15em] text-surface-300 dark:text-surface-600 [writing-mode:vertical-rl] rotate-180">
-              solder
-            </span>
-          </div>
-          {/* Keep the harness-required Clear Canvas affordance reachable even when collapsed. */}
-          <button
-            type="button"
-            onClick={() => resetStore()}
-            className="sr-only"
-          >
-            Clear Canvas
-          </button>
-        </div>
+        /*
+         * Collapsed rail — just an "expand" affordance and the wordmark.
+         *
+         * Earlier this stacked one chip per catalog kind (↗ ⚡ ⎇ ⟳ ⇥ ✓)
+         * to "hint" at the palette behind the rail. The hint didn't land:
+         * each glyph is meaningless without the label beside it, and six
+         * arbitrary symbols stacked vertically read as a cluttered toy
+         * dock rather than "click to see nodes". User flagged it; the
+         * collapsed rail is now a single full-rail tap target that
+         * expands on click — clearer affordance, less visual noise.
+         */
+        <button
+          type="button"
+          aria-label="Expand sidebar"
+          title="Expand sidebar"
+          onClick={() => setCollapsed(false)}
+          className="flex-1 flex flex-col items-center justify-between pt-12 pb-3 text-surface-400 hover:text-surface-700 dark:text-surface-500 dark:hover:text-surface-200 transition-colors group"
+        >
+          <span className="text-xs font-mono uppercase tracking-[0.2em] [writing-mode:vertical-rl] rotate-180 select-none">
+            nodes
+          </span>
+          <span className="solder-wordmark-frame [writing-mode:vertical-rl] rotate-180 select-none">
+            /* solder */
+          </span>
+        </button>
       ) : (
         <>
-          <div className="p-4 border-b border-surface-200 dark:border-surface-800">
-            <div className="mb-2">
-              <span className="eyebrow">AI Builder</span>
-            </div>
-            <textarea
-              value={aiPrompt}
-              onChange={(e) => setAiPrompt(e.target.value)}
-              className="input w-full h-20 text-sm resize-none"
-              placeholder="Describe your integration..."
-            />
-            <button
-              type="button"
-              className="btn btn-primary w-full mt-2 text-sm"
-              onClick={handleBuildAI}
-              disabled={aiLoading || !aiPrompt.trim()}
-            >
-              {aiLoading ? 'Building…' : 'Build with AI'}
-            </button>
-          </div>
+          {/*
+           * Top slot — nested-only.
+           * Root view: nothing (the AI-builder textarea that used to live
+           * here is gone; by the time the canvas is loaded the integration
+           * has already been authored, so the surface was dead weight).
+           * Nested: NestedContextPanel shows which container we're inside
+           * and lets the user pop back out.
+           */}
+          {focusPath.length > 0 && <NestedContextPanel />}
 
-          <div className="flex-1 overflow-auto p-4 space-y-4">
+          <div className="flex-1 overflow-auto solder-scroll-thin p-4 space-y-4">
             <div className="mb-2">
               <span className="eyebrow">Nodes</span>
             </div>
@@ -256,27 +287,61 @@ export default function Sidebar() {
                     </button>
                     {isOpen && (
                       <div className="space-y-1">
-                        {entries.map((entry) => (
-                          <button
-                            key={`${entry.kind}.${entry.action}`}
-                            type="button"
-                            data-testid={`palette-${entry.kind}-${entry.action}`}
-                            data-draggable="palette"
-                            draggable
-                            onDragStart={(e) => handlePaletteDragStart(e, entry)}
-                            onDragEnd={handlePaletteDragEnd}
-                            className="w-full flex items-start gap-3 p-2.5 rounded-lg hover:bg-surface-50 transition-colors text-left dark:hover:bg-surface-900"
-                            onClick={() => handleAdd(entry)}
-                          >
-                            <span className={`mt-0.5 inline-flex items-center justify-center w-7 h-7 rounded-md text-sm ring-1 ${entry.chip}`}>
-                              {entry.icon}
-                            </span>
-                            <span className="flex-1 min-w-0">
-                              <span className="block text-sm font-medium text-surface-900 dark:text-surface-50">{entry.label}</span>
-                              <span className="block text-xs text-surface-500 mt-0.5 truncate dark:text-surface-400">{entry.description}</span>
-                            </span>
-                          </button>
-                        ))}
+                        {entries.map((entry) => {
+                          const brand = brandByKind[entry.kind];
+                          const logoUrl = brandLogoUrl(brand);
+                          return (
+                            <button
+                              key={`${entry.kind}.${entry.action}`}
+                              type="button"
+                              data-testid={`palette-${entry.kind}-${entry.action}`}
+                              data-draggable="palette"
+                              draggable
+                              onDragStart={(e) => handlePaletteDragStart(e, entry)}
+                              onDragEnd={handlePaletteDragEnd}
+                              className="w-full flex items-start gap-3 p-2.5 rounded-lg hover:bg-surface-50 transition-colors text-left dark:hover:bg-surface-900"
+                              onClick={() => handleAdd(entry)}
+                            >
+                              {logoUrl ? (
+                                /*
+                                 * Connector entries get a Brandfetch logo tile —
+                                 * matches user expectation of "company name and
+                                 * logo" in the connector area. The wrapper keeps
+                                 * the same 7×7 footprint as the glyph chip so
+                                 * vertical rhythm holds; the logo sits on a
+                                 * white bed because Brandfetch returns full-
+                                 * colour marks designed for light backgrounds.
+                                 */
+                                <span className="mt-0.5 inline-flex items-center justify-center w-7 h-7 rounded-md ring-1 ring-surface-200 dark:ring-surface-700 bg-white overflow-hidden flex-shrink-0">
+                                  <img
+                                    src={logoUrl}
+                                    alt=""
+                                    className="w-5 h-5 object-contain"
+                                    loading="lazy"
+                                    onError={(e) => {
+                                      // Fall back to the catalog glyph if the
+                                      // CDN can't resolve the logo (rate limit,
+                                      // missing brand, offline). We can't swap
+                                      // back to the glyph after first paint, so
+                                      // just hide the broken image — the chip
+                                      // stays empty rather than rendering a
+                                      // broken-image icon.
+                                      (e.currentTarget as HTMLImageElement).style.display = 'none';
+                                    }}
+                                  />
+                                </span>
+                              ) : (
+                                <span className={`mt-0.5 inline-flex items-center justify-center w-7 h-7 rounded-md text-sm ring-1 ${entry.chip}`}>
+                                  {entry.icon}
+                                </span>
+                              )}
+                              <span className="flex-1 min-w-0">
+                                <span className="block text-sm font-medium text-surface-900 dark:text-surface-50">{entry.label}</span>
+                                <span className="block text-xs text-surface-500 mt-0.5 truncate dark:text-surface-400">{entry.description}</span>
+                              </span>
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
                   </div>

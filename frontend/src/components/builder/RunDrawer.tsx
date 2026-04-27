@@ -147,7 +147,7 @@ export default function RunDrawer({
       role="dialog"
       aria-label="Run details"
       data-testid="run-drawer"
-      className="w-80 flex-shrink-0 bg-white border-l border-surface-200 dark:bg-surface-950 dark:border-surface-800 flex flex-col shadow-[inset_1px_0_0_0_rgb(244_244_245)]"
+      className="w-80 flex-shrink-0 glass-rail rounded-xl flex flex-col pointer-events-auto"
       initial={{ opacity: 0, x: 12 }}
       animate={{ opacity: 1, x: 0 }}
       transition={{ duration: 0.2, ease: [0.22, 0.61, 0.36, 1] }}
@@ -188,7 +188,7 @@ export default function RunDrawer({
       )}
 
       {/* Plan / progress */}
-      <div className="flex-1 overflow-auto p-4 space-y-4">
+      <div className="flex-1 overflow-auto solder-scroll-thin p-4 space-y-4">
             <div>
               <div className="flex items-baseline justify-between mb-2">
                 <span className="eyebrow">plan</span>

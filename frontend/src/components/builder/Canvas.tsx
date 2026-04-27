@@ -1,13 +1,14 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from 'react';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import {
   useIntegrationStore,
   type SolderNode,
   type FocusSegment
 } from '@/stores/integration';
-import { CATALOG, lookupCatalog } from '@/catalog';
+import { CATALOG, lookupCatalog, resolveBranches } from '@/catalog';
 import { DND_MIME_EXISTING, DND_MIME_NEW, type NewNodePayload } from './dnd';
 import StagesGraph, { type DropTarget, type GraphOwner } from './StagesGraph';
+import EmberCanvas from './EmberCanvas';
 
 /**
  * Custom payload passed to variant functions — combines direction (+1 step
@@ -19,49 +20,114 @@ import StagesGraph, { type DropTarget, type GraphOwner } from './StagesGraph';
 interface SceneCustom {
   dir: number;
   zoomScale: number | null;
+  /**
+   * Pixel offset to translate the outgoing scene by during a dive so
+   * the clicked card drifts toward viewport center while growing —
+   * makes the move read as a real dolly-in toward the action, not a
+   * radial zoom that leaves the card pinned to its starting position.
+   */
+  dx: number | null;
+  dy: number | null;
 }
 
 /**
  * Framer Motion variants for the scene-level flight transition.
  *
- * Step-in (dir = +1) with zoomScale set: the outgoing scene scales up around
- * the clicked card (transform-origin set inline on the motion.div). That
- * visually "zooms the camera in" until the card fills the frame — the rest
- * of the canvas flies radially past the viewport edges. The incoming body
- * view then emerges at a small oversize (1.08) and settles to 1.0, reading
- * as "we landed inside and are pulling focus".
+ * The transition layers three signals so a step-into reads as a real
+ * camera move through depth, not just a CSS rescale:
  *
- * Pop-out (dir = -1): symmetric but without a card origin (we don't know
- * which card the user is flying back to), so the camera pulls back with a
- * uniform center origin.
+ *   - **scale**  carries the geometric "we got closer / further".
+ *   - **opacity** carries "the old place is behind us / new place is
+ *     arriving".
+ *   - **filter: blur(...)** carries the depth-of-field rack — the lens
+ *     defocuses as the camera drives in, refocuses as it lands. This is
+ *     the single most important addition; without it the geometry alone
+ *     reads as a UI shrug, not a cinematic move.
  *
- * Reduced-motion users get a plain cross-fade.
+ * Easing is asymmetric on purpose:
+ *
+ *   - exit accelerates (ease-in cubic) — the camera *picks up speed* as
+ *     it dives toward the card.
+ *   - enter decelerates (expo-out) — the camera *settles* into the new
+ *     scene like a landing, not a snap.
+ *
+ * Step-in (dir = +1, zoomScale set): the outgoing scene scales toward
+ * the clicked card (origin baked in via inline transform-origin), bluring
+ * out as it goes. The incoming body view emerges from a slight oversize
+ * (1.15, blurred) and racks into focus at 1.0. The two halves share the
+ * same blur peak at the swap moment, which masks AnimatePresence's hard
+ * cut between exit and enter.
+ *
+ * Pop-out (dir = -1): symmetric scale recede with the same blur rack.
+ * No card origin (we don't know which card the user is returning to), so
+ * the camera pulls back from a center origin instead.
+ *
+ * Reduced-motion: plain opacity cross-fade. No scale, no blur — both
+ * cues that wouldn't be respectful of the user's preference.
  */
+
+const EXIT_EASE = [0.65, 0, 0.85, 0.2] as const;     // accelerating dive
+const ENTER_EASE = [0.16, 1, 0.3, 1] as const;       // decelerating landing
+const EXIT_DURATION = 0.45;
+const ENTER_DURATION = 0.5;
+/**
+ * Cap the dive's terminal scale. Tuned for a *subtle* dive — the eye
+ * needs to register depth motion without the scene visibly stretching
+ * across half the viewport. The geometric "card fills the viewport"
+ * value can climb over 8x for tiny cards on big screens, which read as
+ * a teleport. 2.0x peak (paired with the blur rack) is enough to feel
+ * like a deliberate dolly-in without being intrusive.
+ */
+const ZOOM_SCALE_CAP = 2.0;
+
 const sceneVariants = {
   initial: (c: SceneCustom) => ({
     opacity: 0,
-    scale: c.dir > 0 ? 1.08 : 0.92
+    // Subtle on both sides: dive-in lands the new scene from a 1.06
+    // oversize (was 1.15); pop-out enters from a 0.97 undersize (was
+    // 0.94). Smaller magnitudes keep the transition feeling like a
+    // restrained focus pull rather than a camera lurch.
+    scale: c.dir > 0 ? 1.06 : 0.97,
+    filter: 'blur(6px)'
   }),
   animate: {
     opacity: 1,
-    scale: 1
+    scale: 1,
+    filter: 'blur(0px)',
+    transition: {
+      duration: ENTER_DURATION,
+      ease: ENTER_EASE,
+      // Fade slightly faster than the scale/blur so the new scene
+      // commits visually before its motion fully settles — reads as
+      // "we're here, now adjusting" rather than "still in transit".
+      opacity: { duration: ENTER_DURATION * 0.8, ease: ENTER_EASE }
+    }
   },
   exit: (c: SceneCustom) => ({
     opacity: 0,
     scale:
       c.dir > 0
-        ? // Dive-in exit: scale to the measured zoom factor (covers the
-          // viewport) or fall back to a subtle 1.06 when no card origin
-          // was captured (e.g. jumping into a sibling branch via a crumb).
-          c.zoomScale ?? 1.06
-        : 0.92
+        ? Math.min(c.zoomScale ?? 1.3, ZOOM_SCALE_CAP)
+        : 0.96,
+    // Drift the scene so the clicked card lands at viewport center
+    // during the dive — only on dive-in (dir > 0); pop-out has no
+    // card target. Both default to 0 if no card was captured (e.g.
+    // sibling-branch jump from the context panel).
+    x: c.dir > 0 ? c.dx ?? 0 : 0,
+    y: c.dir > 0 ? c.dy ?? 0 : 0,
+    filter: 'blur(7px)',
+    transition: {
+      duration: EXIT_DURATION,
+      ease: EXIT_EASE,
+      opacity: { duration: EXIT_DURATION * 1.1, ease: EXIT_EASE }
+    }
   })
 } as const;
 
 const reducedSceneVariants = {
   initial: { opacity: 0 },
-  animate: { opacity: 1 },
-  exit: { opacity: 0 }
+  animate: { opacity: 1, transition: { duration: 0.2 } },
+  exit: { opacity: 0, transition: { duration: 0.15 } }
 } as const;
 
 /**
@@ -81,7 +147,9 @@ function resolveScope(
       return { scopedNodes: [], trail };
     }
     const meta = lookupCatalog(parent.kind, parent.action);
-    const branchEntry = meta.containerBranches?.find((b) => b.key === seg.branchKey);
+    // Use the dynamic resolver so Switch's case_* keys resolve to their
+    // configured labels rather than just the upper-cased key.
+    const branchEntry = resolveBranches(parent)?.find((b) => b.key === seg.branchKey);
     trail.push({
       label: meta.label,
       branchLabel: branchEntry?.label ?? seg.branchKey.toUpperCase()
@@ -135,21 +203,32 @@ export default function Canvas() {
   // center origin and 1.04 scale (used for non-dive focus changes like
   // clicking a crumb).
   const sceneContainerRef = useRef<HTMLDivElement>(null);
-  const [zoom, setZoom] = useState<{ origin: string; scale: number } | null>(null);
+  const [zoom, setZoom] = useState<{
+    origin: string;
+    scale: number;
+    /** Translate offset in viewport px to drift the card toward viewport center during the dive. */
+    dx: number;
+    dy: number;
+  } | null>(null);
 
-  // Scrolling-canvas refs/state.
+  // Scrolling-canvas refs.
   //
   // The canvas surface scrolls horizontally as the user navigates through a
   // wide integration (many stages). We re-map mouse-wheel deltaY → scrollLeft
   // so a vertical wheel gesture pans the integration left/right (the user's
   // explicit ask — most builder canvases use horizontal flow). The ember
-  // strip overlay reads scrollLeft to translate itself in lockstep,
-  // producing the "embers slide across the bottom" effect even though the
-  // strip lives outside the scroller (so it stays visually pinned to the
-  // canvas viewport instead of scrolling off as part of the scene).
+  // particle field reads scrollLeft via a ref every animation frame; using
+  // a ref instead of React state keeps the parent from re-rendering on
+  // every wheel tick — the canvas paints itself directly.
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const [scrollLeft, setScrollLeft] = useState(0);
-  const [viewportWidth, setViewportWidth] = useState(0);
+  const scrollLeftRef = useRef(0);
+
+  // Bottom inset of the ember strip (px) — height of the horizontal
+  // scrollbar so flames don't render under it. Tracked dynamically
+  // because OS scrollbars vary (Windows ~17px, macOS overlay 0), but
+  // it doesn't move during normal hover/UI-state changes — only on
+  // window resize and overflow-status flips.
+  const [emberBottom, setEmberBottom] = useState(0);
 
   // Wheel re-mapping. Native listener with passive:false so we can call
   // preventDefault and own the gesture. We only redirect when there's
@@ -169,31 +248,45 @@ export default function Canvas() {
     return () => el.removeEventListener('wheel', onWheel);
   }, []);
 
-  // Track scrollLeft + clientWidth so the ember overlay can translate +
-  // tile correctly. Throttled to rAF — raw scroll events fire faster than
-  // we can usefully render, and React state updates at scroll rate would
-  // pile up.
+  // Mirror the live scroll position into a ref. EmberCanvas reads this on
+  // its own rAF loop, so we don't even need to throttle here — but we
+  // still install the scroll listener as passive: true so it doesn't
+  // block scrolling itself.
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
-    let raf = 0;
     const sync = () => {
-      raf = 0;
-      setScrollLeft(el.scrollLeft);
-      setViewportWidth(el.clientWidth);
-    };
-    const onScroll = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(sync);
+      scrollLeftRef.current = el.scrollLeft;
     };
     sync();
-    el.addEventListener('scroll', onScroll, { passive: true });
-    const ro = new ResizeObserver(sync);
-    ro.observe(el);
+    el.addEventListener('scroll', sync, { passive: true });
+    return () => el.removeEventListener('scroll', sync);
+  }, []);
+
+  // Track horizontal scrollbar height so the ember strip can sit just
+  // above it. We deliberately do NOT observe the scroller's scrollable
+  // content here — that would fire on every hover-driven height change
+  // inside the stages and we want the ember field to behave as a
+  // stable backdrop, independent of UI state. A ResizeObserver on the
+  // scroller's *outer* box only fires on real layout events (window
+  // resize, sidebar toggle), which is what we want.
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+
+    const update = () => {
+      setEmberBottom(scroller.offsetHeight - scroller.clientHeight);
+    };
+
+    update();
+
+    const ro = new ResizeObserver(update);
+    ro.observe(scroller);
+    window.addEventListener('resize', update);
+
     return () => {
-      cancelAnimationFrame(raf);
-      el.removeEventListener('scroll', onScroll);
       ro.disconnect();
+      window.removeEventListener('resize', update);
     };
   }, []);
 
@@ -213,18 +306,40 @@ export default function Canvas() {
     // transform-origin accepts px pairs.
     const ox = cardRect.left + cardRect.width / 2 - sceneRect.left;
     const oy = cardRect.top + cardRect.height / 2 - sceneRect.top;
-    // Scale: how much the scene must grow for the card to fill the frame.
-    // Use max of the two ratios so the card covers both axes. Capped so the
-    // transform doesn't become absurd for very small cards in very large
-    // viewports (would flatten the animation with a compositing fit).
-    const scale = Math.min(
-      8,
-      Math.max(
-        2.5,
-        Math.max(sceneRect.width / cardRect.width, sceneRect.height / cardRect.height)
-      )
+    // Scale the dive to ZOOM_SCALE_CAP at most. We deliberately ignore
+    // the geometric "fill the viewport" value (sceneRect / cardRect can
+    // be 8-10x) because at that magnitude the scene visibly stretches
+    // and the move reads as intrusive. A flat 1.4–2.0 range, modulated
+    // slightly by card size, keeps the dive a gentle dolly-in. Smaller
+    // cards still get a touch more zoom (more "we crossed depth") via
+    // a soft mix between the cap and a 1.4 floor.
+    const fillRatio = Math.max(
+      sceneRect.width / cardRect.width,
+      sceneRect.height / cardRect.height
     );
-    setZoom({ origin: `${ox}px ${oy}px`, scale });
+    // Map the ratio (typically 4–10) into our 1.4–2.0 working range.
+    // log compression keeps the curve gentle: a 10x card and a 4x card
+    // get scales ~1.95 vs ~1.55, not 2.0 vs 1.4.
+    const t = Math.min(1, Math.max(0, (Math.log2(fillRatio) - 2) / 2));
+    const scale = 1.4 + t * (ZOOM_SCALE_CAP - 1.4);
+    /*
+     * Directional drift — translate the scene during the dive so the
+     * card ends at viewport center (slightly above, ~42% Y, to match
+     * the existing "center 45%" framing). Without this, scaling around
+     * the card's own origin keeps the card pinned at its starting
+     * position and everything else radiates outward — which reads as a
+     * radial zoom, not a camera dolly toward the action. Adding the
+     * translate makes the card grow AND drift to where the user's eye
+     * is pointed, which is what "dolly-in" actually looks like in
+     * cinema.
+     */
+    const cardCenterVpX = cardRect.left + cardRect.width / 2;
+    const cardCenterVpY = cardRect.top + cardRect.height / 2;
+    const targetVpX = window.innerWidth / 2;
+    const targetVpY = window.innerHeight * 0.42;
+    const dx = targetVpX - cardCenterVpX;
+    const dy = targetVpY - cardCenterVpY;
+    setZoom({ origin: `${ox}px ${oy}px`, scale, dx, dy });
   }, []);
 
   // Reset the zoom record after the exit finishes so the next non-dive
@@ -365,20 +480,8 @@ export default function Canvas() {
     e.preventDefault();
   }
 
-  // Embers strip — render enough 1:1 video tiles to fill the viewport plus
-  // ~2 tiles of buffer on each side so the wrap-around translate never
-  // exposes an empty edge. The strip is OUTSIDE the scroller so it stays
-  // pinned to the canvas viewport bottom (vertical scroll won't pull it
-  // off-screen); horizontal motion is faked by translating the row by
-  // -scrollLeft modulo a single tile width, which loops seamlessly because
-  // every tile is the same looping clip.
-  const EMBER_TILE_PX = 128; // matches h-32 (square video → square tile)
-  const emberTileCount = Math.max(8, Math.ceil(viewportWidth / EMBER_TILE_PX) + 4);
-  // Safe modulo (handles scrollLeft = 0 and any positive value).
-  const emberOffset = ((scrollLeft % EMBER_TILE_PX) + EMBER_TILE_PX) % EMBER_TILE_PX;
-
   return (
-    <div className="flex-1 relative">
+    <div className="relative w-full h-full">
       <div
         ref={scrollerRef}
         className="absolute inset-0 solder-canvas-surface overflow-auto"
@@ -414,26 +517,42 @@ export default function Canvas() {
         >
           <AnimatePresence
             mode="wait"
-            custom={{ dir: direction, zoomScale: zoom?.scale ?? null }}
+            custom={{
+              dir: direction,
+              zoomScale: zoom?.scale ?? null,
+              dx: zoom?.dx ?? null,
+              dy: zoom?.dy ?? null
+            }}
             initial={false}
           >
             <motion.div
               key={sceneKey}
-              custom={{ dir: direction, zoomScale: zoom?.scale ?? null }}
+              custom={{
+              dir: direction,
+              zoomScale: zoom?.scale ?? null,
+              dx: zoom?.dx ?? null,
+              dy: zoom?.dy ?? null
+            }}
               variants={reduceMotion ? reducedSceneVariants : sceneVariants}
               initial="initial"
               animate="animate"
               exit="exit"
-              transition={{
-                // Exit (the big camera zoom) gets more time to sell the
-                // motion; enter is snappy so the new scene lands crisp, not
-                // languid.
-                duration: reduceMotion ? 0.15 : 0.38,
-                ease: [0.32, 0.72, 0.32, 1]
-              }}
               onAnimationComplete={handleAnimationComplete}
-              className="min-h-full flex items-start p-8 gap-2 will-change-transform"
-              style={{ transformOrigin: zoom?.origin ?? 'center 45%' }}
+              className="min-h-full flex items-start pt-[7.5rem] pb-8 pr-[21rem] gap-2 will-change-transform"
+              style={{
+                transformOrigin: zoom?.origin ?? 'center 45%',
+                /*
+                 * Read the live sidebar width Sidebar.tsx publishes onto
+                 * <body>. Falls back to expanded width on first paint so
+                 * cards land in the right place before the effect fires.
+                 * Animated via CSS transition so collapse drags the cards
+                 * left in lockstep with the sidebar's own width animation
+                 * (200ms / linear) — without this, the canvas is dead
+                 * weight and the collapse leaves a visible empty band.
+                 */
+                paddingLeft: 'var(--solder-sidebar-w, 17rem)',
+                transition: 'padding-left 200ms ease'
+              }}
             >
               {/*
                * StagesGraph is ALWAYS mounted — even on an empty canvas — so
@@ -465,92 +584,38 @@ export default function Canvas() {
       </div>
 
       {/*
-       * Breadcrumb — hoisted out of the scroller so horizontal scrolling
-       * doesn't drag it off-screen. Stays pinned to the canvas top with a
-       * translucent backdrop-blur so the scene reads through it. z-30 keeps
-       * it above the ember strip too.
+       * In-canvas breadcrumb removed in the layered-chrome pass — the
+       * NestedContextPanel in the sidebar now carries this load with
+       * richer per-level context (title, headline, branch caption,
+       * loop reduce caption) and click-to-jump-back. Keeping a second
+       * breadcrumb here would just duplicate that information AND
+       * collide visually with the floating topbar above the canvas.
+       * `esc to return` keyboard shortcut still works (handled by the
+       * effect below).
        */}
-      <AnimatePresence initial={false}>
-        {focusPath.length > 0 && (
-          <motion.div
-            key="breadcrumb"
-            className="absolute top-0 left-0 right-0 z-30 flex items-center gap-2 px-4 py-2 bg-black/70 border-b border-surface-800 backdrop-blur-sm text-xs font-mono overflow-hidden pointer-events-auto"
-            onClick={(e) => e.stopPropagation()}
-            data-testid="canvas-breadcrumb"
-            initial={reduceMotion ? {} : { y: -24, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={reduceMotion ? {} : { y: -24, opacity: 0 }}
-            transition={{ duration: 0.22, ease: [0.22, 0.61, 0.36, 1] }}
-          >
-            <button
-              type="button"
-              onClick={() => setFocusPath([])}
-              className="text-surface-400 hover:text-surface-50 transition-colors uppercase tracking-[0.15em]"
-            >
-              main
-            </button>
-            {trail.map((seg, i) => (
-              <Fragment key={i}>
-                <span className="text-surface-700">›</span>
-                <button
-                  type="button"
-                  onClick={() => setFocusPath(focusPath.slice(0, i + 1))}
-                  className={`uppercase tracking-[0.15em] transition-colors ${
-                    i === trail.length - 1
-                      ? 'text-surface-50'
-                      : 'text-surface-400 hover:text-surface-50'
-                  }`}
-                >
-                  {seg.label}
-                  <span className="ml-1 text-surface-500">·</span>
-                  <span className="ml-1">{seg.branchLabel}</span>
-                </button>
-              </Fragment>
-            ))}
-            <span className="ml-auto text-[10px] text-surface-600">
-              esc to return
-            </span>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/*
-       * Ember strip — looping fire video tiled along the bottom of the
-       * canvas. The strip is `pointer-events-none` so it never blocks drags
-       * or clicks on the scene below. `mix-blend-mode: screen` (in the
-       * `.solder-embers-strip` class) drops the video's near-black backdrop
-       * against our deep-black canvas so only the bright embers paint.
+       * Ember field — a fixed-share strip pinned to the bottom of the
+       * canvas viewport. Independent of stage layout: hover effects,
+       * focus dives, and node count don't move it. Stages live in the
+       * top half (motion.div uses items-start), embers live in the
+       * bottom half — natural separation without runtime measurement.
        *
-       * Horizontal motion: we render `tileCount` copies side-by-side and
-       * translate the row by `-emberOffset` (scrollLeft mod tileWidth). As
-       * the user scrolls the integration left/right via the wheel, the
-       * embers slide in lockstep and wrap seamlessly because each tile is
-       * the same loop. The mp4's own playback adds the natural flicker on
-       * top, so the embers feel alive even when the user isn't scrolling.
+       * `bottom: emberBottom` keeps flames clear of the horizontal
+       * scrollbar; `pointer-events-none` keeps the strip from
+       * blocking drags or clicks. See EmberCanvas.tsx for the
+       * particle system.
+       *
+       * `w-full` is load-bearing: <canvas> is a replaced element with
+       * intrinsic ratio 300×150, which beats `left:0; right:0` for
+       * sizing — without explicit width the canvas would shrink to a
+       * fraction of the viewport.
        */}
-      <div
-        className="solder-embers-strip absolute bottom-0 left-0 right-0 h-32 overflow-hidden pointer-events-none z-20"
-        aria-hidden="true"
-      >
-        <div
-          className="flex h-full will-change-transform"
-          style={{ transform: `translate3d(${-emberOffset}px, 0, 0)` }}
-        >
-          {Array.from({ length: emberTileCount }).map((_, i) => (
-            <video
-              key={i}
-              src="/solder-embers.mp4"
-              autoPlay
-              loop
-              muted
-              playsInline
-              preload="auto"
-              className="h-full flex-none object-cover"
-              style={{ width: `${EMBER_TILE_PX}px` }}
-            />
-          ))}
-        </div>
-      </div>
+      <EmberCanvas
+        scrollLeftRef={scrollLeftRef}
+        className="absolute left-0 w-full h-1/2 pointer-events-none z-20"
+        style={{ bottom: emberBottom }}
+      />
     </div>
   );
 }

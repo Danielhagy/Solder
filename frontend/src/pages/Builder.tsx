@@ -1,10 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import Canvas from '@/components/builder/Canvas';
 import Sidebar from '@/components/builder/Sidebar';
 import PropertiesPanel from '@/components/builder/PropertiesPanel';
-import TriggerStrip from '@/components/builder/TriggerStrip';
 import {
   useIntegrationStore,
   type IntegrationConfig as StoreIntegrationConfig,
@@ -22,9 +21,10 @@ function snapshotKey(
   name: string,
   isLibrary: boolean,
   trigger: TriggerConfig,
-  config: StoreIntegrationConfig
+  config: StoreIntegrationConfig,
+  environment: 'sandbox' | 'production' = 'sandbox'
 ): string {
-  return JSON.stringify({ name, isLibrary, trigger, config });
+  return JSON.stringify({ name, isLibrary, trigger, config, environment });
 }
 
 /** Compact "saved 12s ago" / "saved 3m ago" phrasing for the dirty indicator. */
@@ -40,8 +40,12 @@ function formatSavedAgo(savedAt: number, now: number): string {
 }
 
 export default function Builder() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const id = searchParams.get('id');
+  const navigate = useNavigate();
+  const params = useParams<{ id?: string }>();
+  // Route: /integrations/:id where :id is either a UUID or the literal "new".
+  // Treat "new" as a fresh canvas — same effect as no id at all.
+  const routeId = params.id;
+  const id = !routeId || routeId === 'new' ? null : routeId;
 
   const [integrationName, setIntegrationName] = useState('New Integration');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
@@ -50,6 +54,11 @@ export default function Builder() {
     null
   );
   const [isLibrary, setIsLibrary] = useState(false);
+  // Per-integration environment. 'sandbox' uses Solder's mock-engine with
+  // synthesised data; 'production' routes connector ops through the chosen
+  // Connection's real credentials + base_url. Defaults to sandbox so a fresh
+  // integration is safe to run.
+  const [environment, setEnvironment] = useState<'sandbox' | 'production'>('sandbox');
   const [showHistoryDialog, setShowHistoryDialog] = useState(false);
   const [versions, setVersions] = useState<IntegrationVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
@@ -110,6 +119,7 @@ export default function Builder() {
         setIntegrationName(integration.name);
         setCurrentIntegrationId(integration.id);
         setIsLibrary(integration.is_library === true);
+        setEnvironment(integration.environment === 'production' ? 'production' : 'sandbox');
         // Stamp the saved snapshot post-load so the dirty indicator reads
         // "clean" immediately. Normalizing through the store first ensures
         // the key we compute matches what the user's edits will diff against.
@@ -119,7 +129,8 @@ export default function Builder() {
             integration.name,
             integration.is_library === true,
             loadedTrigger,
-            normalized
+            normalized,
+            integration.environment === 'production' ? 'production' : 'sandbox'
           )
         );
         setSavedAt(Date.now());
@@ -135,6 +146,11 @@ export default function Builder() {
 
   const toConfig = useIntegrationStore((s) => s.toConfig);
   const trigger = useIntegrationStore((s) => s.trigger);
+  // Subscribed so the topbar's back-to-main affordance shows/hides as the
+  // user dives into / pops out of nested branches. Cheap selector; no
+  // re-render for unrelated store changes.
+  const isNested = useIntegrationStore((s) => s.focusPath.length > 0);
+  const setFocusPath = useIntegrationStore((s) => s.setFocusPath);
   // Subscribing here drives re-renders of the dirty indicator whenever the
   // canvas changes. `toConfig()` reads from these same slices.
   const nodes = useIntegrationStore((s) => s.nodes);
@@ -147,8 +163,8 @@ export default function Builder() {
   const [now, setNow] = useState(() => Date.now());
 
   const currentSnapshot = useMemo(
-    () => snapshotKey(integrationName, isLibrary, trigger, { nodes, variables }),
-    [integrationName, isLibrary, trigger, nodes, variables]
+    () => snapshotKey(integrationName, isLibrary, trigger, { nodes, variables }, environment),
+    [integrationName, isLibrary, trigger, nodes, variables, environment]
   );
   // Empty canvas + default name counts as clean; avoids a noisy "unsaved" label
   // the moment the user lands on /.
@@ -187,7 +203,8 @@ export default function Builder() {
           name: integrationName,
           config: toConfig(),
           trigger,
-          is_library: isLibrary
+          is_library: isLibrary,
+          environment
         });
       } else {
         // New integration -> POST; adopt the new id for subsequent saves.
@@ -195,11 +212,12 @@ export default function Builder() {
           name: integrationName,
           config: toConfig(),
           trigger,
-          is_library: isLibrary
+          is_library: isLibrary,
+          environment
         });
         setCurrentIntegrationId(created.id);
         // Reflect the id in the URL so the page is reload-safe / shareable.
-        setSearchParams({ id: created.id }, { replace: true });
+        navigate(`/integrations/${created.id}`, { replace: true });
       }
       setSavedSnapshot(pendingSnapshot);
       setSavedAt(Date.now());
@@ -250,7 +268,8 @@ export default function Builder() {
           restored.name,
           restored.is_library === true,
           restoredTrigger,
-          normalized
+          normalized,
+          environment
         )
       );
       setSavedAt(Date.now());
@@ -298,18 +317,20 @@ export default function Builder() {
           name: integrationName,
           config: toConfig(),
           trigger,
-          is_library: isLibrary
+          is_library: isLibrary,
+          environment
         });
         integrationId = created.id;
         setCurrentIntegrationId(created.id);
-        setSearchParams({ id: created.id }, { replace: true });
+        navigate(`/integrations/${created.id}`, { replace: true });
       } else {
         // Commit the current canvas state so the run uses what the user sees.
         await api.updateIntegration(integrationId, {
           name: integrationName,
           config: toConfig(),
           trigger,
-          is_library: isLibrary
+          is_library: isLibrary,
+          environment
         });
       }
       setSavedSnapshot(pendingSnapshot);
@@ -353,119 +374,220 @@ export default function Builder() {
   }
 
   return (
-    <div className="h-[calc(100vh-73px)] flex overflow-hidden bg-surface-100 dark:bg-surface-950">
-      <Sidebar />
-      <div className="flex-1 flex flex-col min-w-0">
-        <div className="bg-white border-b border-surface-200 px-4 py-2.5 flex items-center justify-between gap-3 dark:bg-surface-950 dark:border-surface-800">
-          <div className="flex items-center gap-3 min-w-0 flex-1">
-            <input
-              type="text"
-              value={integrationName}
-              onChange={(e) => setIntegrationName(e.target.value)}
-              className="text-base font-semibold min-w-0 flex-1 max-w-[40ch] border-none focus:outline-none focus:ring-0 bg-transparent px-0 py-1 dark:text-surface-50 dark:placeholder-surface-500"
-              placeholder="Integration name"
-            />
-            <span
-              aria-hidden="true"
-              className="h-4 w-px bg-surface-200 dark:bg-surface-800 flex-shrink-0"
-            />
-            <span
-              className="text-xs font-mono flex items-center gap-1.5 flex-shrink-0"
-              data-testid="save-status"
-              data-dirty={dirty ? 'true' : 'false'}
-              title={
-                dirty
-                  ? 'You have unsaved changes'
-                  : savedAt
-                    ? `Last saved ${new Date(savedAt).toLocaleTimeString()}`
-                    : 'Nothing to save yet'
-              }
-            >
-              {dirty ? (
-                <>
-                  <span
-                    className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400"
-                    aria-hidden="true"
-                  />
-                  <span className="text-amber-600 dark:text-amber-300">unsaved</span>
-                </>
-              ) : savedAt ? (
-                <>
-                  <span
-                    className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 dark:bg-emerald-400"
-                    aria-hidden="true"
-                  />
-                  <span className="text-surface-500 dark:text-surface-400">
-                    {formatSavedAgo(savedAt, now)}
-                  </span>
-                </>
-              ) : (
-                <span className="text-surface-400 dark:text-surface-500">draft</span>
-              )}
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5 flex-shrink-0">
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={openHistory}
-              disabled={!currentIntegrationId}
-              title={currentIntegrationId ? 'View version history' : 'Save first to see history'}
-              data-testid="history-button"
-            >
-              History
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setShowSaveDialog(true)}
-            >
-              <span>Save</span>
-              <span className="ml-2 text-xs text-surface-400 font-mono hidden md:inline dark:text-surface-500">⌘S</span>
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={runIntegration}
-              disabled={trigger.type !== 'manual' || running}
-              data-testid="run-button"
-            >
-              {running
-                ? 'running…'
-                : trigger.type === 'manual'
-                  ? '→ Run'
-                  : `→ Trigger: ${trigger.type}`}
-            </button>
-          </div>
-        </div>
-        <TriggerStrip />
+    /*
+     * Builder workspace — single elevated dark scene.
+     *
+     * Layer 0 (z-0): the Canvas component, full-bleed. Owns the dotted-grid
+     *                surface, the parallax ember field, and all drag/drop +
+     *                scroll behaviour. Pinned via `inset-0`.
+     * Layer 1 (z-10): floating glass-rail chrome. Positioned absolutely so
+     *                 the rails *float over* the canvas — embers and grid
+     *                 visibly bleed through their backdrop-blur. The wrapper
+     *                 is `pointer-events-none` so drag/click events fall
+     *                 through the gaps to the canvas; each rail re-enables
+     *                 pointer-events on itself.
+     */
+    <div className="h-[calc(100vh-73px)] relative overflow-hidden bg-black">
+      <div className="absolute inset-0 z-0">
         <Canvas />
-        {/* Hidden marker so the Playwright harness can assert the loaded id. */}
-        <input
-          type="hidden"
-          data-testid="builder-integration-id"
-          value={currentIntegrationId ?? ''}
-          readOnly
-        />
       </div>
-      {/* Right rail: run drawer takes over while a run is in flight,
-          otherwise the properties editor / run plan. Sharing the same slot
-          avoids the double-rail + button-overlap the design review flagged. */}
-      {runDrawerOpen ? (
-        <RunDrawer
-          open={runDrawerOpen}
-          status={runStatus}
-          runId={runId}
-          startedAt={runStartedAt}
-          steps={runSteps}
-          output={runOutput}
-          error={runError}
-          planNodes={nodes}
-          onClose={() => setRunDrawerOpen(false)}
-        />
-      ) : (
-        <PropertiesPanel />
-      )}
+
+      <div className="absolute inset-0 z-10 flex pointer-events-none p-2 gap-2">
+        <Sidebar />
+
+        <div className="flex-1 flex flex-col gap-2 min-w-0">
+          {/* Top rail — back-to-main (when nested), integration name, saved-status, action buttons. */}
+          <div className="glass-rail rounded-xl px-4 py-2 flex items-center justify-between gap-3 pointer-events-auto">
+            <div className="flex items-center gap-3 min-w-0 flex-1">
+              {/*
+               * Back-to-main affordance — visible only when the user has
+               * stepped into a Branch / Loop / Subprocess body. Was a
+               * tiny mono-caps text link in the sidebar's context
+               * panel; promoted here because (a) the topbar is the
+               * natural location for "where am I and how do I get
+               * out" affordances and (b) the eyebrow-tiny treatment
+               * was missable. The forge-tinted hover state and the
+               * arrow nudge keep the interaction tactile without
+               * raising the visual weight at rest.
+               */}
+              <AnimatePresence initial={false}>
+                {isNested && (
+                  <motion.button
+                    key="back-to-main"
+                    type="button"
+                    onClick={() => setFocusPath([])}
+                    title="Return to the main canvas"
+                    data-testid="topbar-back-to-main"
+                    className="group flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 -ml-1 rounded-md text-sm text-surface-600 hover:text-forge-600 hover:bg-forge-500/[0.06] dark:text-surface-300 dark:hover:text-forge-400 dark:hover:bg-forge-500/[0.10] transition-colors flex-shrink-0"
+                    initial={{ opacity: 0, x: -8, width: 0 }}
+                    animate={{ opacity: 1, x: 0, width: 'auto' }}
+                    exit={{ opacity: 0, x: -8, width: 0 }}
+                    transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <span
+                      className="text-base leading-none transition-transform group-hover:-translate-x-0.5"
+                      aria-hidden="true"
+                    >
+                      ←
+                    </span>
+                    <span>Back</span>
+                  </motion.button>
+                )}
+              </AnimatePresence>
+              {isNested && (
+                <span
+                  aria-hidden="true"
+                  className="h-4 w-px bg-surface-200/70 dark:bg-white/10 flex-shrink-0"
+                />
+              )}
+              <input
+                type="text"
+                value={integrationName}
+                onChange={(e) => setIntegrationName(e.target.value)}
+                className="font-display text-base font-semibold tracking-[-0.01em] min-w-0 flex-1 max-w-[40ch] border-none focus:outline-none focus:ring-0 bg-transparent px-0 py-1 text-surface-900 dark:text-surface-50 dark:placeholder-surface-500"
+                placeholder="Untitled integration"
+              />
+              <span
+                aria-hidden="true"
+                className="h-4 w-px bg-surface-200/70 dark:bg-white/10 flex-shrink-0"
+              />
+              <span
+                className="text-xs font-mono flex items-center gap-1.5 flex-shrink-0"
+                data-testid="save-status"
+                data-dirty={dirty ? 'true' : 'false'}
+                title={
+                  dirty
+                    ? 'You have unsaved changes'
+                    : savedAt
+                      ? `Last saved ${new Date(savedAt).toLocaleTimeString()}`
+                      : 'Nothing to save yet'
+                }
+              >
+                {dirty ? (
+                  <>
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400"
+                      aria-hidden="true"
+                    />
+                    <span className="text-amber-600 dark:text-amber-300">unsaved</span>
+                  </>
+                ) : savedAt ? (
+                  <>
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 dark:bg-emerald-400"
+                      aria-hidden="true"
+                    />
+                    <span className="text-surface-500 dark:text-surface-400">
+                      {formatSavedAgo(savedAt, now)}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-surface-400 dark:text-surface-500">draft</span>
+                )}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() =>
+                  setEnvironment((e) => (e === 'sandbox' ? 'production' : 'sandbox'))
+                }
+                className={`btn ${
+                  environment === 'production'
+                    ? 'btn-forge-outline text-amber-700 border-amber-400/60 dark:text-amber-300 dark:border-amber-400/40'
+                    : 'btn-ghost text-emerald-700 border-emerald-400/60 dark:text-emerald-300 dark:border-emerald-400/40'
+                }`}
+                title={
+                  environment === 'sandbox'
+                    ? 'Synthetic data via mock-engine. Click to switch to live API.'
+                    : 'Live API via the chosen Connection. Click to switch to synthetic.'
+                }
+                data-testid="environment-toggle"
+                data-environment={environment}
+              >
+                <span className="font-mono text-[11px] uppercase tracking-wider">
+                  {environment === 'sandbox' ? '◆ synthetic' : '● live'}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={openHistory}
+                disabled={!currentIntegrationId}
+                title={currentIntegrationId ? 'View version history' : 'Save first to see history'}
+                data-testid="history-button"
+              >
+                History
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowSaveDialog(true)}
+              >
+                <span>Save</span>
+                <span className="ml-2 text-xs text-surface-400 font-mono hidden md:inline dark:text-surface-500">⌘S</span>
+              </button>
+              <button
+                type="button"
+                className="btn btn-forge"
+                onClick={runIntegration}
+                disabled={trigger.type !== 'manual' || running}
+                data-testid="run-button"
+              >
+                {running
+                  ? 'running…'
+                  : trigger.type === 'manual'
+                    ? '→ Run'
+                    : `→ Trigger: ${trigger.type}`}
+              </button>
+            </div>
+          </div>
+
+          {/* Trigger now lives as the first card on the canvas (visual
+              stage 01) rather than a floating rail — see TriggerCard +
+              StagesGraph's root injection. */}
+
+          {/* Spacer — embers + canvas show through here. */}
+          <div className="flex-1 min-h-0" />
+        </div>
+
+        {/* Right rail: run drawer takes over during a live run, otherwise
+            the properties editor / run plan. Sharing the same slot avoids
+            the double-rail + button-overlap the design review flagged. */}
+        {runDrawerOpen ? (
+          <RunDrawer
+            open={runDrawerOpen}
+            status={runStatus}
+            runId={runId}
+            startedAt={runStartedAt}
+            steps={runSteps}
+            output={runOutput}
+            error={runError}
+            planNodes={nodes}
+            onClose={() => setRunDrawerOpen(false)}
+          />
+        ) : (
+          <PropertiesPanel
+            onTestPlan={(selectedIds) => {
+              // v1: subset execution falls through to a full run; the
+              // selection is tracked client-side and surfaces in the
+              // button label so users can see what would be tested.
+              // Subset execution is a backend concern (TODO).
+              void selectedIds;
+              runIntegration();
+            }}
+            running={running}
+          />
+        )}
+      </div>
+
+      {/* Hidden marker so the Playwright harness can assert the loaded id. */}
+      <input
+        type="hidden"
+        data-testid="builder-integration-id"
+        value={currentIntegrationId ?? ''}
+        readOnly
+      />
 
       <AnimatePresence>
         {showSaveDialog && (

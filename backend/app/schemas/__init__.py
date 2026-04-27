@@ -1,3 +1,5 @@
+from app.schemas.connection import ConnectionIn, ConnectionOut
+from app.schemas.connector import ConnectorOut, DiscoverableEndpoint
 from app.schemas.integration import (
     AILearningCreate,
     AILearningResponse,
@@ -24,4 +26,8 @@ __all__ = [
     "RunResponse",
     "AILearningCreate",
     "AILearningResponse",
+    "ConnectorOut",
+    "DiscoverableEndpoint",
+    "ConnectionIn",
+    "ConnectionOut",
 ]

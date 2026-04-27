@@ -9,18 +9,40 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from app.temporal.activities import (
         APICallInput,
-        APICallOutput,
+        ConnectorResolveInput,
+        IngestToBankInput,
         PaginationConfig,
         TransformInput,
-        TransformOutput,
         evaluate_condition,
         execute_api_call,
         execute_paginated_api_call,
+        execute_python_sandbox,
         execute_transform,
+        gen_ulid,
+        gen_uuid_v4,
+        get_current_time,
+        ingest_to_bank,
         load_subprocess_config,
         notify_completion,
+        random_float_in_range,
+        random_int_in_range,
         record_learning,
+        resolve_connector_request,
     )
+    # Pure-compute executors run inline in the workflow because every
+    # function is deterministic on its inputs (no I/O, random, or clock).
+    # See `backend/app/runtime/pure.py` for the contract.
+    from app.runtime.pure import PURE_DISPATCH
+    # Local helper used inline by `state.set` / `state.get`. Lives in pure.py
+    # next to the rest of the JSONPath conventions.
+    from app.runtime.pure import _get_at as _state_get_at
+    # Static set of registered connectors — used by `_dispatch_node` to
+    # detect that a node's `kind` belongs to a connector op (e.g. 'zip',
+    # 'hubspot') without colliding with built-in dispatch keys like
+    # 'http', 'transform'. The set itself is read-only at module load.
+    from app.connectors import REGISTRY as _CONNECTOR_REGISTRY
+
+_CONNECTOR_KINDS: frozenset[str] = frozenset(_CONNECTOR_REGISTRY.keys())
 
 
 @dataclass
@@ -53,6 +75,9 @@ _LEGACY_TYPE_MAP: dict[str, tuple[str, str]] = {
 }
 
 
+_UNSET: Any = object()
+
+
 class _Skipped:
     """Sentinel wrapper used when a node's ``when`` gate evaluates falsy.
 
@@ -64,6 +89,42 @@ class _Skipped:
 
     def __init__(self, data: Any) -> None:
         self.data = data
+
+
+class APICallError(Exception):
+    """Raised by `_execute_api_call` when the underlying activity reports failure.
+
+    Carries the classifier's `error_kind` (`'transient' | 'permanent' | 'auth'`)
+    and the response `status_code` so per-iteration tracking, retry policies,
+    and the run drawer can branch without re-parsing the error string.
+    See `RESILIENCE_PLAN.md` §2.1.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_kind: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.status_code = status_code
+
+
+class _StopRun(BaseException):
+    """Raised by `logic.gate` with `on_false='stop'` to end the run cleanly.
+
+    Inherits from ``BaseException`` (not ``Exception``) so ``asyncio.gather``
+    with ``return_exceptions=True`` doesn't swallow it — we want it to
+    propagate up to the workflow's ``run()`` method which catches it as a
+    successful termination.
+    """
+
+    def __init__(self, data: Any, reason: str = "gate stopped run") -> None:
+        super().__init__(reason)
+        self.data = data
+        self.reason = reason
 
 
 def _node_dispatch_key(node: dict) -> str:
@@ -88,6 +149,28 @@ class IntegrationRunWorkflow:
     async def run(self, input: IntegrationRunInput) -> IntegrationRunOutput:
         """Execute the integration workflow."""
         workflow.logger.info(f"Starting integration run: {input.run_id}")
+
+        # Run-scope variables. Populated by `state.set` and read by
+        # `state.get`; references in expressions can also reach them via
+        # `$.vars.<name>` once the runtime exposes them in the data scope
+        # (a future enhancement — for v1, only state.get reads them).
+        self._vars: dict[str, Any] = {}
+
+        # Side-channel for nodes that want to enrich their step record
+        # with metadata that doesn't belong in the downstream output.
+        # `_dispatch_node` writes into this dict keyed by `node["id"]`;
+        # `_run_stages` (and the legacy path) merges anything queued for
+        # a node into the step record on append, then clears it. Today
+        # used by `logic.loop` to surface per-iteration tracking
+        # (RESILIENCE_PLAN.md R-1) without polluting the loop's output
+        # shape — downstream sees the reduce-mode output, the run drawer
+        # sees the iteration breakdown.
+        self._step_extras: dict[str, dict] = {}
+
+        # Connector ops (zip.list_vendors, …) need the integration id at
+        # dispatch time so the resolve activity can route to the right
+        # mock-engine bucket and look up `environment` from the row.
+        self._integration_id: str = input.integration_id
 
         steps: list[dict] = []
         current_data: Any = input.input_data
@@ -135,6 +218,21 @@ class IntegrationRunWorkflow:
                 steps=steps,
             )
 
+        except _StopRun as stop:
+            # `logic.gate` with `on_false='stop'` ended the run gracefully.
+            # Treat as success with whatever data was carried at the gate.
+            workflow.logger.info(f"Integration run stopped cleanly: {stop.reason}")
+            await workflow.execute_activity(
+                notify_completion,
+                args=[input.run_id, True, stop.data, None, steps],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            return IntegrationRunOutput(
+                success=True,
+                output=stop.data,
+                steps=steps,
+            )
+
         except Exception as e:
             workflow.logger.error(f"Integration run failed: {str(e)}")
 
@@ -166,6 +264,37 @@ class IntegrationRunWorkflow:
                 error=str(e),
             )
 
+    def _build_step_record(
+        self,
+        node: dict,
+        stage: int,
+        status: str,
+        *,
+        output: Any = _UNSET,
+        error: Optional[str] = None,
+    ) -> dict:
+        """Compose a step record + merge any side-channel extras for this node.
+
+        Centralised so every step-append site (stages success/skipped/failed,
+        legacy success/failed) folds in `self._step_extras[node.id]` the same
+        way. Use the `_UNSET` sentinel to distinguish "no output" (skip the
+        key) from "output is None" (include the key with value None).
+        """
+        rec: dict = {
+            "node_id": node["id"],
+            "node_type": _node_dispatch_key(node),
+            "stage": stage,
+            "status": status,
+        }
+        if output is not _UNSET:
+            rec["output"] = output
+        if error is not None:
+            rec["error"] = error
+        extras = self._step_extras.pop(node["id"], None)
+        if extras:
+            rec.update(extras)
+        return rec
+
     async def _run_stages(
         self, nodes: list, current_data: Any, steps: list
     ) -> Any:
@@ -194,33 +323,21 @@ class IntegrationRunWorkflow:
                 for n, r in zip(batch, results):
                     if isinstance(r, Exception):
                         steps.append(
-                            {
-                                "node_id": n["id"],
-                                "node_type": _node_dispatch_key(n),
-                                "stage": stage,
-                                "status": "failed",
-                                "error": str(r),
-                            }
+                            self._build_step_record(
+                                n, stage, "failed", error=str(r)
+                            )
                         )
                     elif isinstance(r, _Skipped):
                         steps.append(
-                            {
-                                "node_id": n["id"],
-                                "node_type": _node_dispatch_key(n),
-                                "stage": stage,
-                                "status": "skipped",
-                                "output": r.data,
-                            }
+                            self._build_step_record(
+                                n, stage, "skipped", output=r.data
+                            )
                         )
                     else:
                         steps.append(
-                            {
-                                "node_id": n["id"],
-                                "node_type": _node_dispatch_key(n),
-                                "stage": stage,
-                                "status": "success",
-                                "output": r,
-                            }
+                            self._build_step_record(
+                                n, stage, "success", output=r
+                            )
                         )
                 raise first_error
 
@@ -229,24 +346,16 @@ class IntegrationRunWorkflow:
                 if isinstance(r, _Skipped):
                     outputs[n["id"]] = r.data
                     steps.append(
-                        {
-                            "node_id": n["id"],
-                            "node_type": _node_dispatch_key(n),
-                            "stage": stage,
-                            "status": "skipped",
-                            "output": r.data,
-                        }
+                        self._build_step_record(
+                            n, stage, "skipped", output=r.data
+                        )
                     )
                 else:
                     outputs[n["id"]] = r
                     steps.append(
-                        {
-                            "node_id": n["id"],
-                            "node_type": _node_dispatch_key(n),
-                            "stage": stage,
-                            "status": "success",
-                            "output": r,
-                        }
+                        self._build_step_record(
+                            n, stage, "success", output=r
+                        )
                     )
 
             if len(outputs) == 1:
@@ -289,6 +398,9 @@ class IntegrationRunWorkflow:
                 if not gate:
                     step_result["status"] = "skipped"
                     step_result["output"] = current_data
+                    extras = self._step_extras.pop(node_id, None)
+                    if extras:
+                        step_result.update(extras)
                     steps.append(step_result)
                     continue
 
@@ -325,9 +437,15 @@ class IntegrationRunWorkflow:
             except Exception as e:
                 step_result["status"] = "failed"
                 step_result["error"] = str(e)
+                extras = self._step_extras.pop(node_id, None)
+                if extras:
+                    step_result.update(extras)
                 steps.append(step_result)
                 raise
 
+            extras = self._step_extras.pop(node_id, None)
+            if extras:
+                step_result.update(extras)
             steps.append(step_result)
 
         return current_data
@@ -411,20 +529,99 @@ class IntegrationRunWorkflow:
             out = await self._run_stages(sub_nodes, current_data, [])
             return {"called": target_id, "mode": "once", "output": out}
         if dispatch_key == "logic.loop":
-            # Iterate the `body` sub-chain once per item in the `over` expression.
+            # Iterate the `body` sub-chain once per item in the `over`
+            # expression. R-1 (RESILIENCE_PLAN.md):
+            #   - `on_failure: 'halt' | 'continue'` controls per-iteration error
+            #     policy. Default `halt` for back-compat.
+            #   - `reduce: 'collect' | 'last' | 'count' | 'none'` (already on
+            #     the catalog) is now honored at runtime.
+            #   - Per-iteration records flow through `self._step_extras` so the
+            #     run drawer can render a per-item rollup without polluting
+            #     the loop's downstream output.
             branches = node.get("branches") or {}
             body = branches.get("body", []) or []
             over_expr = cfg.get("over", "$.items")
             items = self._get_value_at_path(current_data, over_expr)
             if not isinstance(items, list):
                 items = []
-            results: list[Any] = []
-            for item in items:
-                if body:
-                    results.append(await self._run_stages(body, item, []))
-                else:
-                    results.append(item)
-            return {"iterations": len(items), "results": results}
+
+            on_failure = (cfg.get("on_failure") or "halt").lower()
+            reduce_mode = (cfg.get("reduce") or "collect").lower()
+
+            succeeded_outputs: list[Any] = []
+            iteration_records: list[dict] = []
+
+            for idx, item in enumerate(items):
+                rec: dict = {"index": idx, "status": "pending"}
+                try:
+                    if body:
+                        out = await self._run_stages(body, item, [])
+                    else:
+                        out = item
+                except Exception as e:
+                    rec["status"] = "failed"
+                    rec["error"] = str(e)
+                    # Surface the classifier kind when available so the run
+                    # drawer can show "[transient]" / "[permanent]" / "[auth]"
+                    # tags per iteration. RESILIENCE_PLAN.md §2.1.
+                    if isinstance(e, APICallError):
+                        if e.error_kind:
+                            rec["error_kind"] = e.error_kind
+                        if e.status_code:
+                            rec["status_code"] = e.status_code
+                    iteration_records.append(rec)
+                    if on_failure == "halt":
+                        # Plumb iteration metadata into the step record before
+                        # propagating, so the run drawer can show "made it to
+                        # item N before halting".
+                        self._step_extras[node["id"]] = {
+                            "iterations": iteration_records,
+                            "succeeded": len(succeeded_outputs),
+                            "failed": sum(
+                                1 for r in iteration_records if r["status"] == "failed"
+                            ),
+                            "on_failure": on_failure,
+                            "reduce": reduce_mode,
+                        }
+                        raise
+                    # 'continue' (and future 'checkpoint') — keep iterating.
+                    continue
+                rec["status"] = "success"
+                rec["output"] = out
+                succeeded_outputs.append(out)
+                iteration_records.append(rec)
+
+            failed_count = sum(
+                1 for r in iteration_records if r["status"] == "failed"
+            )
+
+            # Iteration metadata lives on the step record, not on the
+            # downstream value. `_run_stages` will merge it on append.
+            self._step_extras[node["id"]] = {
+                "iterations": iteration_records,
+                "succeeded": len(succeeded_outputs),
+                "failed": failed_count,
+                "on_failure": on_failure,
+                "reduce": reduce_mode,
+            }
+
+            # Reduce mode shapes the downstream input. Honoring it matches
+            # the catalog's declared `outputShape: 'array'` for collect /
+            # 'scalar' for count etc., and matches the editor's "Output"
+            # caption. Pre-R-1 the runtime always returned `{iterations,
+            # results}` regardless — that envelope is gone now; downstream
+            # nodes that previously read `$.results` need to migrate.
+            if reduce_mode == "collect":
+                return succeeded_outputs
+            if reduce_mode == "last":
+                return succeeded_outputs[-1] if succeeded_outputs else None
+            if reduce_mode == "count":
+                return len(succeeded_outputs)
+            if reduce_mode == "none":
+                # Side-effect mode — pass through whatever was upstream.
+                return current_data
+            # Unknown reduce mode → safest default is the collect array.
+            return succeeded_outputs
         if dispatch_key == "output.passthrough":
             mapping = cfg.get("mapping", {})
             if mapping:
@@ -433,7 +630,276 @@ class IntegrationRunWorkflow:
                     out[k] = self._get_value_at_path(current_data, p)
                 return out
             return current_data
+        if dispatch_key == "logic.assert":
+            # Halt the run with the user-authored message when the predicate
+            # is falsy. Pass-through on success (downstream sees current_data).
+            ok = await workflow.execute_activity(
+                evaluate_condition,
+                args=[cfg.get("expression", "true"), current_data],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            if not ok:
+                raise Exception(cfg.get("message") or "Assertion failed")
+            return current_data
+        if dispatch_key == "logic.gate":
+            # Truthy → pass-through. Falsy → either skip (returns _Skipped so
+            # current_data flows on) or stop (raises _StopRun, caught at the
+            # workflow root as a successful early termination).
+            ok = await workflow.execute_activity(
+                evaluate_condition,
+                args=[cfg.get("expression", "true"), current_data],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            if ok:
+                return current_data
+            on_false = (cfg.get("on_false") or "skip").lower()
+            if on_false == "stop":
+                raise _StopRun(current_data, "logic.gate predicate falsy with on_false='stop'")
+            return _Skipped(current_data)
+        if dispatch_key == "logic.switch":
+            # Evaluate cases[] in order; first truthy match wins. If nothing
+            # matches, fall to `default`. Recurse into the matched branch
+            # like logic.branch does.
+            cases = cfg.get("cases") or []
+            branches = node.get("branches") or {}
+            picked_key: Optional[str] = None
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                key = case.get("key")
+                expr = case.get("match", "true")
+                try:
+                    matched = await workflow.execute_activity(
+                        evaluate_condition,
+                        args=[expr or "true", current_data],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                except Exception:
+                    matched = False
+                if matched and key:
+                    picked_key = key
+                    break
+            if picked_key is None:
+                picked_key = "default"
+            sub_nodes = branches.get(picked_key, []) or []
+            if not sub_nodes:
+                return {"case": picked_key, "output": current_data}
+            sub_output = await self._run_stages(sub_nodes, current_data, [])
+            return {"case": picked_key, "output": sub_output}
+        # === State scope (Wave B-3) ===========================================
+        # `set` / `get` read & write `self._vars` inline — these are pure on
+        # the workflow's own state, no activity needed.
+        if dispatch_key == "state.set":
+            name = (cfg.get("name") or "").strip()
+            if not name:
+                raise Exception("state.set: 'name' is required")
+            value_ref = cfg.get("value", "$")
+            if isinstance(value_ref, str) and value_ref.startswith("$"):
+                resolved = _state_get_at(current_data, value_ref)
+            else:
+                resolved = value_ref
+            self._vars[name] = resolved
+            return current_data  # passthrough — declared `outputShape: 'side-effect'`
+        if dispatch_key == "state.get":
+            name = (cfg.get("name") or "").strip()
+            if not name:
+                raise Exception("state.get: 'name' is required")
+            if name in self._vars:
+                return self._vars[name]
+            return cfg.get("default")
+        # ID generators + RNG — must be activities so the result is replayable.
+        if dispatch_key == "state.uuid":
+            return await workflow.execute_activity(
+                gen_uuid_v4,
+                start_to_close_timeout=timedelta(seconds=5),
+            )
+        if dispatch_key == "state.ulid":
+            return await workflow.execute_activity(
+                gen_ulid,
+                args=[(cfg.get("prefix") or "")],
+                start_to_close_timeout=timedelta(seconds=5),
+            )
+        if dispatch_key == "state.random_int":
+            return await workflow.execute_activity(
+                random_int_in_range,
+                args=[
+                    int(cfg.get("min") or 0),
+                    int(cfg.get("max") or 100),
+                    str(cfg.get("seed") or ""),
+                ],
+                start_to_close_timeout=timedelta(seconds=5),
+            )
+        if dispatch_key == "state.random_float":
+            return await workflow.execute_activity(
+                random_float_in_range,
+                args=[
+                    float(cfg.get("min") or 0),
+                    float(cfg.get("max") or 1),
+                    str(cfg.get("seed") or ""),
+                ],
+                start_to_close_timeout=timedelta(seconds=5),
+            )
+        if dispatch_key == "time.now":
+            return await workflow.execute_activity(
+                get_current_time,
+                args=[
+                    str(cfg.get("format") or "iso"),
+                    str(cfg.get("tz") or "UTC"),
+                ],
+                start_to_close_timeout=timedelta(seconds=5),
+            )
+        if dispatch_key == "code.python":
+            timeout_ms = int(cfg.get("timeout_ms") or 30000)
+            allow = list(cfg.get("allow_imports") or [])
+            # Source-level template substitution lives inside the activity
+            # (`_splice_path_refs`) — the user writes `{{$.path}}` tokens
+            # inline in the Python source and they get spliced in as
+            # `repr()`-encoded literals before compile.
+            envelope = await workflow.execute_activity(
+                execute_python_sandbox,
+                args=[
+                    cfg.get("source") or "",
+                    current_data,
+                    timeout_ms,
+                    allow,
+                ],
+                # Activity timeout sits a couple seconds above the in-script
+                # timeout so we never race the sandbox's own kill path.
+                start_to_close_timeout=timedelta(milliseconds=timeout_ms + 5000),
+            )
+            error = envelope.get("error") if isinstance(envelope, dict) else None
+            if error:
+                kind = (envelope.get("error_kind") or "runtime") if isinstance(envelope, dict) else "runtime"
+                raise Exception(f"code.python ({kind}): {error}")
+            return envelope.get("result") if isinstance(envelope, dict) else envelope
+        # Pure-compute nodes (data.*, format.*, math.*, str.*, time.parse/format/add/diff)
+        # run inline in the workflow — every function is deterministic, so
+        # workflow replay is safe. See `backend/app/runtime/pure.py`.
+        pure_fn = PURE_DISPATCH.get(dispatch_key)
+        if pure_fn is not None:
+            return pure_fn(cfg, current_data)
+        # data.ingest_to_bank — persist the upstream array into the
+        # integration's test bank so subsequent sandbox runs can serve it
+        # via the mock-engine. The "items" source defaults to the upstream
+        # data; an explicit JSONPath in cfg.items_path overrides.
+        if dispatch_key == "data.ingest_to_bank":
+            items_source = current_data
+            items_path = cfg.get("items_path")
+            if items_path:
+                items_source = self._get_value_at_path(current_data, items_path)
+            result = await workflow.execute_activity(
+                ingest_to_bank,
+                IngestToBankInput(
+                    integration_id=self._integration_id,
+                    entity_type=cfg.get("entity_type") or "",
+                    items=items_source,
+                    id_path=cfg.get("id_path") or "$.id",
+                    connector_name=cfg.get("connector_name"),
+                    replace=bool(cfg.get("replace", False)),
+                ),
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            if not result.success:
+                raise Exception(f"ingest_to_bank failed: {result.error}")
+            # Pass the upstream payload through unchanged so a downstream
+            # node still sees the records — the ingest is a side effect.
+            # The step record carries the (inserted, updated, bank_id)
+            # rollup via _step_extras for the run drawer.
+            self._step_extras[node["id"]] = {
+                "ingested": {
+                    "inserted": result.inserted,
+                    "updated": result.updated,
+                    "test_bank_id": result.test_bank_id,
+                    "entity_type": cfg.get("entity_type"),
+                }
+            }
+            return current_data
+        # Connector ops (zip.list_vendors, hubspot.list_contacts, …). Anything
+        # whose `kind` matches a registered connector resolves the connection
+        # secret + endpoint into a real HTTP request, then reuses the same
+        # API-call activity as `http.request`. Sandbox runs route to the
+        # local mock-engine; production runs hit the real connector.
+        node_kind = node.get("kind")
+        if node_kind in _CONNECTOR_KINDS:
+            return await self._execute_connector_op(node, cfg, current_data)
         raise Exception(f"Unknown node kind: {dispatch_key}")
+
+    async def _execute_connector_op(
+        self, node: dict, config: dict, data: Any
+    ) -> Any:
+        """Resolve a connector op to a concrete HTTP call and invoke it.
+
+        The `endpoint` block on the node's config carries the path/method
+        the catalog pinned at design time; the `credential_id` (optional in
+        sandbox, required in production) selects which connection's secret
+        to use. The resolve activity does the DB read + decrypt; the
+        existing API-call activity does the actual request.
+        """
+        connector_name = node.get("kind") or ""
+        endpoint = config.get("endpoint") or {}
+        endpoint_path = endpoint.get("path") or "/"
+        endpoint_method = (endpoint.get("method") or "GET").upper()
+        connection_id = (
+            config.get("credential_id")
+            or config.get("connection_id")
+            or None
+        )
+
+        resolved = await workflow.execute_activity(
+            resolve_connector_request,
+            ConnectorResolveInput(
+                integration_id=self._integration_id,
+                connector_name=connector_name,
+                endpoint_path=endpoint_path,
+                connection_id=connection_id,
+            ),
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        if not resolved.success:
+            raise APICallError(
+                f"connector {connector_name}.{endpoint_path}: {resolved.error}",
+                error_kind="permanent",
+                status_code=None,
+            )
+
+        # Body interpolation happens once here; the per-call activity does not
+        # re-interpolate. Any `headers` declared on the node are merged after
+        # the resolved auth headers so user overrides win.
+        body = config.get("body")
+        if body:
+            body = self._interpolate_dict(body, data if isinstance(data, dict) else {})
+        merged_headers = {**resolved.headers, **(config.get("headers") or {})}
+
+        # Pagination is honoured exactly like http.request — the catalog
+        # ships connector ops with `pagination: { mode: 'none' }` by default.
+        synthetic_cfg = {
+            "method": endpoint_method,
+            "url": resolved.url,
+            "headers": merged_headers,
+            "body": body,
+            "auth": None,
+            "timeout": config.get("timeout", 30),
+            "pagination": config.get("pagination") or {"mode": "none"},
+        }
+        # Apply any resolved query-param auth (api_key_query) to the URL.
+        if resolved.query:
+            synthetic_cfg["url"] = self._merge_query_params(resolved.url, resolved.query)
+        return await self._execute_api_call(synthetic_cfg, data)
+
+    def _merge_query_params(self, url: str, extra: dict) -> str:
+        """Merge ``extra`` query params into ``url`` (existing keys win on collision).
+
+        Local helper duplicated here so the workflow doesn't import the
+        activity-side ``_merge_query`` (which would couple workflow imports
+        to module load order). Implementation is intentionally tiny.
+        """
+        if not extra:
+            return url
+        sep = "&" if "?" in url else "?"
+        encoded = "&".join(f"{k}={v}" for k, v in extra.items())
+        return f"{url}{sep}{encoded}"
 
     async def _execute_api_call(self, config: dict, data: dict) -> Any:
         """Execute an API call node.
@@ -487,7 +953,11 @@ class IntegrationRunWorkflow:
             )
 
             if not paginated_result.success:
-                raise Exception(f"Paginated API call failed: {paginated_result.error}")
+                raise APICallError(
+                    f"Paginated API call failed: {paginated_result.error}",
+                    error_kind=paginated_result.error_kind,
+                    status_code=paginated_result.status_code or None,
+                )
 
             # Downstream nodes expect the items array as the flat payload so they
             # can map/loop over it directly without drilling into a wrapper.
@@ -513,7 +983,11 @@ class IntegrationRunWorkflow:
         )
 
         if not result.success:
-            raise Exception(f"API call failed: {result.error}")
+            raise APICallError(
+                f"API call failed: {result.error}",
+                error_kind=result.error_kind,
+                status_code=result.status_code or None,
+            )
 
         return result.body
 

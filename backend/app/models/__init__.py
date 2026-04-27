@@ -1,4 +1,5 @@
 from app.models.base import Base
+from app.models.connector import Connection, Connector
 from app.models.integration import (
     AILearning,
     Integration,
@@ -6,6 +7,13 @@ from app.models.integration import (
     OpenAPISpec,
     Run,
 )
+from app.models.mock_engine import (
+    MockSession,
+    MockSessionWrite,
+    MockSpec,
+    RunAuditEvent,
+)
+from app.models.test_bank import TestBank, TestBankEntity
 
 __all__ = [
     "Base",
@@ -14,4 +22,12 @@ __all__ = [
     "OpenAPISpec",
     "Run",
     "AILearning",
+    "Connection",
+    "Connector",
+    "MockSpec",
+    "MockSession",
+    "MockSessionWrite",
+    "RunAuditEvent",
+    "TestBank",
+    "TestBankEntity",
 ]

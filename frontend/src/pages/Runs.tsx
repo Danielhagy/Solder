@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
+import { motion } from 'framer-motion';
 import { api, type Integration, type Run } from '@/api/client';
 import { RunRowSkeleton } from '@/components/Skeleton';
 import PageHeader from '@/components/PageHeader';
@@ -127,7 +128,7 @@ function StepBlock({ step, index, isLast }: { step: StepRecord; index: number; i
   );
 }
 
-export default function History() {
+export default function Runs() {
   const [params, setParams] = useSearchParams();
   const integrationFilter = params.get('integration_id') ?? '';
 
@@ -162,8 +163,6 @@ export default function History() {
     };
   }, [integrationFilter]);
 
-  // When a row is selected, re-fetch that run for the freshest step list.
-  // listRuns already ships the steps but a manual click should feel live.
   useEffect(() => {
     if (!selected) return;
     let cancelled = false;
@@ -196,9 +195,9 @@ export default function History() {
   return (
     <div className="max-w-6xl mx-auto p-6">
       <PageHeader
-        eyebrow="run history"
-        title="Run History"
-        description="Last 100 executions across every integration. Pick a row for the per-step trace."
+        eyebrow="runs"
+        title="Runs"
+        description="Last 100 executions across every integration. Pick a row for the per-step trace. Environment + error-corpus filters land alongside v1 phases."
         action={
           <div className="flex items-center gap-2">
             <label className="eyebrow">filter</label>
@@ -211,7 +210,7 @@ export default function History() {
                 else setParams({});
                 setSelected(null);
               }}
-              data-testid="history-filter"
+              data-testid="runs-filter"
             >
               <option value="">All integrations</option>
               {integrations.map((i) => (
@@ -245,7 +244,7 @@ export default function History() {
           title="Nothing has run"
           description="Runs appear here after you build and execute an integration. Start with a blank canvas or ask the AI builder."
           action={
-            <Link to="/" className="btn btn-primary">
+            <Link to="/integrations/new" className="btn btn-primary">
               Create an Integration
             </Link>
           }
@@ -253,11 +252,11 @@ export default function History() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
           <div className="space-y-3" data-testid="run-list">
-            {runs.map((run) => {
+            {runs.map((run, idx) => {
               const name =
                 nameById.get(run.integration_id) ?? run.integration_id.slice(0, 8);
               return (
-                <button
+                <motion.button
                   key={run.id}
                   type="button"
                   className={`card p-4 w-full text-left hover:shadow-md transition-shadow ${
@@ -265,6 +264,9 @@ export default function History() {
                   }`}
                   onClick={() => setSelected(run)}
                   data-testid={`run-row-${run.id}`}
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.18, ease: 'easeOut', delay: 0.03 * idx }}
                 >
                   <div className="flex items-center justify-between mb-2 gap-2">
                     <span className="text-sm font-medium text-surface-800 dark:text-surface-200 truncate">
@@ -282,7 +284,7 @@ export default function History() {
                       {formatDate(run.created_at)}
                     </span>
                   </div>
-                </button>
+                </motion.button>
               );
             })}
           </div>

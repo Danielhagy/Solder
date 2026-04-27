@@ -46,10 +46,10 @@ async def main():
         await page.wait_for_timeout(400)
         await shot(page, "integrations-light-forced")
 
-        await page.goto(BASE + "/history", wait_until="networkidle")
+        await page.goto(BASE + "/runs", wait_until="networkidle")
         await force_theme(page, "light")
         await page.wait_for_timeout(400)
-        await shot(page, "history-light-forced")
+        await shot(page, "runs-light-forced")
 
         # 2. History detail selected
         first = await page.query_selector("[data-testid^='run-row-']")

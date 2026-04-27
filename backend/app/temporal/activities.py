@@ -56,13 +56,51 @@ class APICallInput:
 
 @dataclass
 class APICallOutput:
-    """Output from API call activity."""
+    """Output from API call activity.
+
+    ``error_kind`` (RESILIENCE_PLAN.md §2.1) categorises every failure into
+    one of four buckets so downstream consumers — Loop iteration tracking,
+    the run drawer, future retry logic — can branch without re-parsing the
+    error string. ``None`` on success.
+    """
 
     status_code: int
     headers: dict[str, str]
     body: Any
     success: bool
     error: Optional[str] = None
+    error_kind: Optional[str] = None  # 'transient' | 'permanent' | 'auth' | None
+
+
+def _classify_http_error(
+    status_code: int, exc: Optional[BaseException] = None
+) -> Optional[str]:
+    """Bucket an HTTP failure into transient / permanent / auth.
+
+    Inputs are alternative — pass ``status_code`` for response-based errors,
+    or ``exc`` for transport-level errors with no status. Returns ``None``
+    when the call actually succeeded so the field stays falsy on success.
+
+    Buckets:
+      auth       — 401, 403 (credential problem; halt the run)
+      transient  — 5xx, 429, 408, network timeouts, connection resets
+      permanent  — 4xx semantic failures (validation, missing reference)
+    """
+    if exc is not None:
+        # Network / timeout / connection-level errors are nearly always
+        # worth a retry; the caller can decide whether to actually retry.
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+            return "transient"
+        # Fall back to permanent for anything we don't recognise — surfaces
+        # in the UI and prevents a runaway retry on a genuinely broken call.
+        return "permanent"
+    if status_code in (401, 403):
+        return "auth"
+    if status_code in (408, 429) or 500 <= status_code < 600:
+        return "transient"
+    if 400 <= status_code < 500:
+        return "permanent"
+    return None
 
 
 @dataclass
@@ -127,6 +165,9 @@ async def execute_api_call(input: APICallInput) -> APICallOutput:
                 headers=dict(response.headers),
                 body=body,
                 success=response.is_success,
+                error_kind=_classify_http_error(response.status_code)
+                if not response.is_success
+                else None,
             )
 
     except Exception as e:
@@ -137,6 +178,7 @@ async def execute_api_call(input: APICallInput) -> APICallOutput:
             body=None,
             success=False,
             error=str(e),
+            error_kind=_classify_http_error(0, exc=e),
         )
 
 
@@ -323,6 +365,9 @@ async def execute_paginated_api_call(input: APICallInput) -> APICallOutput:
             body={"items": all_items, "pages": pages, "total_items": len(all_items)},
             success=False,
             error=str(e),
+            # Classify by status when we have one (last response was a non-2xx),
+            # otherwise fall back to the exception-shape classifier.
+            error_kind=_classify_http_error(last_status) if last_status else _classify_http_error(0, exc=e),
         )
 
 
@@ -394,6 +439,31 @@ async def evaluate_condition(expression: str, data: Any) -> bool:
                     value = value[part]
             return value
 
+        def parse_literal(s: str) -> Any:
+            """Parse an RHS literal: numbers, booleans, null, JSON, or bare string.
+
+            Pre-fix this only handled quoted strings / arrays / objects, so
+            `$.amount > 0` evaluated as `42 > "0"` and TypeErrored. JSON
+            covers the numeric/boolean/null/double-quoted cases naturally;
+            single-quoted strings (`'approved'` — common in JSONPath-ish
+            DSLs) get a manual unwrap before falling back to bare string.
+            """
+            stripped = s.strip()
+            # JSONPath-ish predicates often write strings with single quotes
+            # (`$.status == 'approved'`). JSON proper requires double quotes
+            # so json.loads would reject — handle this before the JSON pass
+            # so we don't end up comparing `'approved'` to `approved`.
+            if (
+                len(stripped) >= 2
+                and stripped[0] == "'"
+                and stripped[-1] == "'"
+            ):
+                return stripped[1:-1]
+            try:
+                return json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return s
+
         # Parse simple comparisons
         for op in ["==", "!=", ">=", "<=", ">", "<", " in ", " not in "]:
             if op in expression:
@@ -406,13 +476,13 @@ async def evaluate_condition(expression: str, data: Any) -> bool:
                     if left.startswith("$."):
                         left_val = get_value(left[1:])
                     else:
-                        left_val = json.loads(left) if left.startswith(("[", "{", '"')) else left
+                        left_val = parse_literal(left)
 
                     # Get right value
                     if right.startswith("$."):
                         right_val = get_value(right[1:])
                     else:
-                        right_val = json.loads(right) if right.startswith(("[", "{", '"')) else right
+                        right_val = parse_literal(right)
 
                     # Evaluate
                     if op == "==":
@@ -518,3 +588,736 @@ async def load_subprocess_config(subprocess_id: str) -> dict:
                 f"Integration {subprocess_id} is not marked as a library subprocess"
             )
         return integration.config or {}
+
+
+# ---------------------------------------------------------------------------
+# Non-deterministic node activities (Wave B-3)
+#
+# Anything that depends on the wall clock, randomness, or freshly-generated
+# identifiers must run as a Temporal activity, not inline in the workflow,
+# so the result is recorded in workflow history and replays deterministically.
+# These are the minimum-viable implementations; bigger ones live in pure.py
+# alongside the rest of the catalog when their inputs are deterministic.
+# ---------------------------------------------------------------------------
+
+
+@activity.defn
+async def gen_uuid_v4() -> str:
+    """Fresh UUID v4 string. Used by the `state.uuid` node."""
+    import uuid as _uuid
+
+    return str(_uuid.uuid4())
+
+
+@activity.defn
+async def gen_ulid(prefix: str = "") -> str:
+    """Generate a ULID, optionally prefixed.
+
+    Crockford-base32 encoded; 48 bits of millisecond timestamp + 80 bits of
+    cryptographic randomness. No external dep. Format: `<prefix>_<ulid>` if
+    prefix is non-empty, otherwise the bare 26-char ULID.
+    """
+    import secrets
+    import time as _time
+
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    ms = int(_time.time() * 1000) & ((1 << 48) - 1)
+    rand_bytes = secrets.token_bytes(10)  # 80 bits
+    n = (ms << 80) | int.from_bytes(rand_bytes, "big")
+    out = ""
+    for _ in range(26):
+        out = alphabet[n & 0x1F] + out
+        n >>= 5
+    return f"{prefix.strip()}_{out}" if prefix and prefix.strip() else out
+
+
+@activity.defn
+async def random_int_in_range(min_v: int, max_v: int, seed: str = "") -> int:
+    """Random integer in `[min_v, max_v]` inclusive. Optional `seed` for determinism."""
+    import random
+
+    rng = random.Random(seed) if seed else random.Random()
+    if max_v < min_v:
+        min_v, max_v = max_v, min_v
+    return rng.randint(int(min_v), int(max_v))
+
+
+@activity.defn
+async def random_float_in_range(min_v: float, max_v: float, seed: str = "") -> float:
+    """Random float in `[min_v, max_v)`. Optional `seed` for determinism."""
+    import random
+
+    rng = random.Random(seed) if seed else random.Random()
+    if max_v < min_v:
+        min_v, max_v = max_v, min_v
+    return rng.uniform(float(min_v), float(max_v))
+
+
+@activity.defn
+async def get_current_time(fmt: str = "iso", tz: str = "UTC") -> Any:
+    """Wall-clock now, in one of three formats.
+
+    `fmt` ∈ {`iso`, `unix`, `unix_ms`}; `tz` is an IANA name applied to the
+    `iso` form. Falls back to UTC if the zone is unknown.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    fmt = (fmt or "iso").lower()
+    if fmt == "unix":
+        return int(now.timestamp())
+    if fmt == "unix_ms":
+        return int(now.timestamp() * 1000)
+    # iso
+    if tz and tz.upper() != "UTC":
+        try:
+            from zoneinfo import ZoneInfo
+
+            return now.astimezone(ZoneInfo(tz)).isoformat()
+        except Exception:  # noqa: BLE001
+            # Unknown zone — fall through to UTC.
+            pass
+    return now.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Python sandbox (Wave B-7)
+#
+# Runs user-supplied scripts in a `python -I` subprocess with a JSON-piped
+# bootstrap. The bootstrap filters `__import__` to a stdlib-safe set plus
+# the user's optional `allow_imports`, strips dangerous builtins (open,
+# exec, eval, compile, ...), and captures stdout. Returns a structured
+# envelope so the workflow dispatcher can map errors to the
+# `code.python` errorModes declared on the frontend catalog entry.
+#
+# This is a *dev-grade* sandbox: it stops accidental misuse, not a
+# determined attacker. v2 multi-user wants OS-level isolation (firejail /
+# Docker / gVisor); the seam is this activity — swap the subprocess
+# invocation, keep the JSON contract.
+# ---------------------------------------------------------------------------
+
+
+_PYTHON_SANDBOX_BOOTSTRAP = r'''
+import sys, json, builtins, io
+
+# Save references the bootstrap itself needs *before* we strip builtins.
+# After the strip, `exec`/`compile` etc. are unavailable in user code AND
+# in any subsequent bootstrap line — so we capture what we need locally.
+_real_exec = exec
+_real_compile = compile
+# `traceback` is needed by the error-formatting branches below; once
+# the SAFE import filter installs, `import traceback` would fail. Bind
+# the module here so the except-blocks can format full source-line
+# traces for the editor's gutter.
+import traceback as _real_traceback
+
+payload = json.loads(sys.stdin.read())
+src = payload.get("source") or ""
+data = payload.get("data")
+allow = set(payload.get("allow_imports") or [])
+
+# Always-allowed stdlib safe set. These are pure-compute / data modules with
+# no I/O, network, or process control. Adding to this list belongs in the
+# repo, not in user config.
+SAFE = {
+    # Headline data / compute modules users will import explicitly.
+    "json", "re", "math", "random", "datetime", "time",
+    "collections", "itertools", "functools", "string",
+    "base64", "hashlib", "hmac", "urllib.parse",
+    "decimal", "statistics", "csv", "io", "textwrap",
+    "calendar", "operator", "copy", "types",
+    # Pure-compute stdlib internals that show up as transitive deps.
+    # Adding these here lets `Counter.most_common` (uses heapq) and
+    # similar idioms work without forcing the user to know about them.
+    "heapq", "bisect", "numbers", "abc", "enum",
+    "_collections_abc", "_weakrefset",
+}
+allow_set = SAFE | allow
+
+# Pre-warm allowed modules with the *real* importer so their transitive
+# private dependencies (e.g. `textwrap` → `re` → `_sre`, anything → `_io`)
+# land in `sys.modules` before the filter is installed. After this, user
+# `import X` for X in allow_set just hits the import cache and never
+# re-enters the guard recursively.
+_real_import = builtins.__import__
+for _mod in list(allow_set):
+    try:
+        _real_import(_mod)
+    except Exception:
+        pass
+
+# Scrub module-typed attributes that point at blocked modules. Stdlib
+# modules sometimes alias their internal `os` / `sys` deps as `_os` /
+# `_sys` for their own use — stripping those external aliases prevents
+# `random._os.system(...)` style escapes without breaking the module's
+# own internal use of its imports (which goes through fresh lookups,
+# not reflective attribute access). Iterate `sys.modules` not allow_set
+# so we cover transitively-loaded private deps too.
+import types as _types
+def _scrub_blocked_refs(mod, allow):
+    for _name in list(vars(mod)):
+        if _name.startswith("__") and _name.endswith("__"):
+            continue
+        try:
+            _v = getattr(mod, _name, None)
+        except Exception:
+            continue
+        if isinstance(_v, _types.ModuleType):
+            _root = (_v.__name__ or "").split(".")[0]
+            if _root and _root not in allow:
+                try:
+                    delattr(mod, _name)
+                except Exception:
+                    pass
+for _mod_name in list(sys.modules):
+    _m = sys.modules.get(_mod_name)
+    if _m is None:
+        continue
+    _root = _mod_name.split(".")[0]
+    if _root in allow_set:
+        _scrub_blocked_refs(_m, allow_set)
+
+def guarded_import(name, *args, **kwargs):
+    root = name.split(".")[0]
+    if root not in allow_set and name not in allow_set:
+        raise ImportError(f"import of {name!r} is not allowed in this sandbox")
+    return _real_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+
+# Strip dangerous builtins. After this, user code can't open files, eval
+# arbitrary strings, compile new code, or exit out of the sandbox. The
+# bootstrap holds private references above so it can still run user code.
+for unsafe in ("open", "exec", "eval", "compile", "input", "breakpoint",
+               "exit", "quit", "help"):
+    if hasattr(builtins, unsafe):
+        try:
+            delattr(builtins, unsafe)
+        except Exception:
+            pass
+
+# Redirect stdout to a buffer so the user's print() output is captured but
+# doesn't pollute the JSON envelope we emit on the real stdout below.
+_buf = io.StringIO()
+sys.stdout = _buf
+
+# Pre-bind the most useful stdlib modules into the user's namespace so
+# everyday scripts don't need import boilerplate. This is a quality-of-
+# life convenience, not a security boundary — the import filter above
+# is what enforces what's allowed; this just spares the user from
+# typing `import json` to use `json.dumps`. Anything not in this list
+# is still reachable via `import X` (subject to the SAFE filter).
+_AUTO_BIND = (
+    "json", "math", "re", "datetime", "random",
+    "collections", "itertools", "functools",
+    "string", "base64", "hashlib",
+    "decimal", "statistics", "textwrap", "csv",
+    "operator", "copy",
+)
+ns = {"data": data, "result": None}
+for _name in _AUTO_BIND:
+    try:
+        ns[_name] = _real_import(_name)
+    except Exception:
+        pass
+
+err = None
+err_kind = None
+output = None
+try:
+    # `compile` first so a SyntaxError is reported with the right error_kind
+    # (otherwise exec catches everything as RuntimeError-ish).
+    _code = _real_compile(src, "<sandbox>", "exec")
+    _real_exec(_code, ns)
+    output = ns.get("result")
+except SyntaxError as e:
+    # SyntaxErrors carry their own line/offset metadata; preserve them
+    # via the standard formatter so the editor can pin a `File
+    # "<sandbox>", line N` marker at the right gutter.
+    err = "".join(_real_traceback.format_exception_only(type(e), e)).rstrip()
+    err_kind = "syntax"
+except ImportError as e:
+    err = str(e)
+    err_kind = "import_blocked"
+except Exception as e:
+    # Capture the full traceback so error panels can extract `File
+    # "<sandbox>", line N` and pin a CodeMirror gutter marker.
+    # `format_exc()` includes the chain, the offending source frame,
+    # and the typed exception name — strictly more useful than
+    # `f"{type(e).__name__}: {e}"`.
+    err = _real_traceback.format_exc().rstrip()
+    err_kind = "runtime"
+
+sys.stdout = sys.__stdout__
+
+# JSON-serialise. `default=str` protects against datetime / Decimal / etc.
+# slipping through; if the user's `result` truly isn't JSONable we get a
+# string fallback rather than a crash.
+print(json.dumps({
+    "result": output,
+    "stdout": _buf.getvalue(),
+    "error": err,
+    "error_kind": err_kind,
+}, default=str))
+'''
+
+
+def _splice_path_refs(source: str, data: Any) -> str:
+    """Replace `{{$.path}}` tokens in a Python source string with the
+    `repr()` of the value at that path in `data`.
+
+    The point: the user writes references inline in their source the
+    same way they would in a URL or transform expression — picker
+    grammar, no separate "Variables" UI to fill in. After substitution
+    the source is plain Python whose literal values were determined at
+    runtime. `repr()` always produces a valid Python literal for any
+    JSON-shaped value (primitives, lists, dicts, None, True, False),
+    so the result parses cleanly.
+
+    Tokens inside string literals are also replaced — that's
+    intentional, matches user intent ("show me 'name' = `'Alice'`")
+    rather than trying to be clever about string boundaries. The
+    `repr` of a string includes its quotes, so embedded substitutions
+    nest correctly: `f"hi {{$.name}}"` → `f"hi 'Alice'"` (probably not
+    what users want; `f"hi {x}"` with `x = {{$.name}}` is the right
+    pattern for f-strings — but that's a docs issue, not a code one).
+    """
+    import re as _re
+
+    def replace(m: "_re.Match[str]") -> str:
+        path = m.group(1).strip()
+        if not path or path == "$":
+            return repr(data)
+        path = path.lstrip("$.")
+        cur: Any = data
+        for part in path.split("."):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit():
+                idx = int(part)
+                cur = cur[idx] if 0 <= idx < len(cur) else None
+            else:
+                return repr(None)
+            if cur is None:
+                return repr(None)
+        return repr(cur)
+
+    return _re.sub(r"\{\{([^}]+)\}\}", replace, source)
+
+
+@activity.defn
+async def execute_python_sandbox(
+    source: str,
+    data: Any,
+    timeout_ms: int = 30000,
+    allow_imports: Optional[list[str]] = None,
+) -> dict:
+    """Run user-supplied Python in a subprocess sandbox.
+
+    `source` may contain `{{$.path}}` tokens that resolve against `data`
+    and are spliced in as Python literals (`repr()`-encoded) before the
+    bootstrap compiles the script. So the editor can write inline:
+
+        result = {"id_doubled": {{$.id}} * 2, "name": {{$.profile.name}}}
+
+    and the bootstrap exec's:
+
+        result = {"id_doubled": 21 * 2, "name": 'Alice'}
+
+    No Variables UI, no namespace tricks — just template-substitution
+    at the source-string level.
+
+    Returns a structured envelope so the workflow dispatcher can re-raise
+    with the appropriate `code.python` error_kind.
+
+    Errors that escape this activity (subprocess spawn failure, JSON parse
+    failure on the child's output) are turned into `runtime` envelopes too
+    — every code-path produces a usable shape.
+    """
+    # Splice path refs BEFORE handing off to the subprocess — keeps the
+    # bootstrap simple (no template engine in the sandboxed child) and
+    # lets us reuse `data` reads in this same parent process.
+    source = _splice_path_refs(source or "", data)
+    import asyncio
+    import sys as _sys
+
+    proc = await asyncio.create_subprocess_exec(
+        _sys.executable,
+        "-I",
+        "-c",
+        _PYTHON_SANDBOX_BOOTSTRAP,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    payload = json.dumps(
+        {
+            "source": source or "",
+            "data": data,
+            "allow_imports": list(allow_imports or []),
+        },
+        default=str,
+    ).encode("utf-8")
+
+    seconds = max(0.1, float(timeout_ms or 30000) / 1000.0)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(payload),
+            timeout=seconds,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        return {
+            "result": None,
+            "stdout": "",
+            "error": f"script exceeded timeout of {timeout_ms}ms",
+            "error_kind": "timeout",
+        }
+
+    if proc.returncode != 0:
+        return {
+            "result": None,
+            "stdout": "",
+            "error": (stderr or b"").decode("utf-8", errors="replace")
+            or "subprocess exited non-zero",
+            "error_kind": "runtime",
+        }
+
+    try:
+        return json.loads(stdout.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "result": None,
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "error": f"sandbox output unparseable: {e}",
+            "error_kind": "runtime",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Connector ops — resolve the (connection, endpoint) pair into a concrete
+# HTTP request shape (URL + headers + query). The workflow's connector
+# dispatch path delegates here so secret decryption + auth-scheme application
+# stay out of the workflow sandbox.
+#
+# Sandbox runs route to the local mock-engine and don't decrypt secrets —
+# the mock-engine doesn't validate credentials, only that *some* token is
+# present. Production runs read the connection's encrypted secret, apply
+# the auth scheme, and return the real headers/query.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConnectorResolveInput:
+    """Inputs needed to materialise a connector op into a real HTTP request."""
+
+    integration_id: str
+    connector_name: str  # 'zip' | 'hubspot' — taken from node.kind
+    endpoint_path: str  # '/v1/vendors'
+    connection_id: Optional[str] = None  # required for production runs
+
+
+@dataclass
+class ConnectorResolveOutput:
+    """Resolved HTTP shape, plus the environment so the workflow can log it."""
+
+    success: bool
+    url: str
+    headers: dict[str, str]
+    query: dict[str, str]
+    environment: str  # 'sandbox' | 'production'
+    error: Optional[str] = None
+
+
+@activity.defn
+async def resolve_connector_request(
+    input: ConnectorResolveInput,
+) -> ConnectorResolveOutput:
+    """Resolve a connector op into a concrete HTTP request shape.
+
+    Looks at the parent integration's `environment`:
+      - 'sandbox': route through `/api/mock/{integration_id}/{connector}/{path}`
+        and skip secret decryption (the mock-engine accepts any bearer).
+      - 'production': read the chosen connection, decrypt the secret, apply
+        the auth scheme, and return the real headers/query.
+
+    Failures (missing connection, unknown connector, decrypt error) are
+    encoded into the output rather than raised so the workflow can attach
+    them to the failed step record without an activity retry storm.
+    """
+    from app.config import settings
+    from app.connectors import REGISTRY
+    from app.connectors import auth_schemes
+    from app.database import async_session
+    from app.models import Connection, Integration
+    from app.services.connection_crypto import decrypt
+    from sqlalchemy import select
+
+    path = input.endpoint_path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+
+    async with async_session() as session:
+        integration = await session.get(Integration, input.integration_id)
+        if integration is None:
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="sandbox",
+                error=f"integration {input.integration_id} not found",
+            )
+        env = integration.environment or "sandbox"
+
+        if env == "sandbox":
+            # The mock-engine is mounted on the same backend host. We resolve
+            # the base URL from the running config to keep dev (5173/8000) and
+            # any future deploys (different ports) honest.
+            api_base = (
+                getattr(settings, "api_base_url", None)
+                or "http://localhost:8000"
+            ).rstrip("/")
+            url = (
+                f"{api_base}/api/mock/{input.integration_id}/"
+                f"{input.connector_name}{path}"
+            )
+            # Mock-engine just checks "some" bearer is present.
+            return ConnectorResolveOutput(
+                success=True,
+                url=url,
+                headers={"Authorization": "Bearer sandbox"},
+                query={},
+                environment="sandbox",
+            )
+
+        # Production path — connection + secrets are required.
+        if not input.connection_id:
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="production",
+                error="no connection selected for production run",
+            )
+
+        result = await session.execute(
+            select(Connection).where(Connection.id == input.connection_id)
+        )
+        conn = result.scalar_one_or_none()
+        if conn is None:
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="production",
+                error=f"connection {input.connection_id} not found",
+            )
+
+        registered = REGISTRY.get(input.connector_name)
+        base_url = conn.base_url or (registered.base_url if registered else None)
+        if not base_url:
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="production",
+                error=f"no base_url for connector {input.connector_name!r}",
+            )
+
+        try:
+            secrets = decrypt(conn.ciphertext, conn.nonce)
+        except Exception as e:  # noqa: BLE001
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="production",
+                error=f"decrypt failed: {e}",
+            )
+
+        try:
+            applied = auth_schemes.apply(
+                conn.auth_scheme,
+                secrets=secrets,
+                config=conn.config_json or {},
+            )
+        except Exception as e:  # noqa: BLE001
+            return ConnectorResolveOutput(
+                success=False,
+                url="",
+                headers={},
+                query={},
+                environment="production",
+                error=f"auth scheme {conn.auth_scheme!r}: {e}",
+            )
+
+        url = base_url.rstrip("/") + path
+        return ConnectorResolveOutput(
+            success=True,
+            url=url,
+            headers=applied.headers,
+            query=applied.query,
+            environment="production",
+        )
+
+
+# ---------------------------------------------------------------------------
+# data.ingest_to_bank — persist a list of records into the integration's
+# test bank so the mock-engine can serve them on subsequent sandbox runs.
+#
+# Typical pipeline shape: a connector op (live HubSpot pull) → optional
+# transform → ingest_to_bank. The resulting bank rows then back the
+# mock-engine when the same integration is flipped to environment='sandbox'.
+#
+# Idempotent: rows are upserted by `(test_bank_id, entity_type, entity_id)`
+# (the unique index on `test_bank_entities`). Re-running an ingestion with
+# the same data updates the existing row's `data` payload in place.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IngestToBankInput:
+    """Inputs for the data.ingest_to_bank activity."""
+
+    integration_id: str
+    # Required — the row's `entity_type` discriminator. Must match the
+    # mock spec's entity_type so list endpoints can round-trip the data.
+    entity_type: str
+    # The item array. The activity walks each item, extracts the id via
+    # `id_path`, and upserts. Non-list inputs are wrapped in a single-item
+    # list so a node-level transform doesn't need to wrap explicitly.
+    items: Any
+    # JSONPath-ish into each item to pull the entity id (default '$.id').
+    # When the path resolves to a non-string, str() is applied.
+    id_path: str = "$.id"
+    # Connector name the bank is keyed against. Falls back to the
+    # integration's first non-default test_bank if absent.
+    connector_name: Optional[str] = None
+    # Truncate existing rows of this entity_type before inserting. Useful
+    # for refresh-style pulls; default false (additive upsert).
+    replace: bool = False
+
+
+@dataclass
+class IngestToBankOutput:
+    """Result of an ingestion. Returned to the workflow as the node output."""
+
+    success: bool
+    inserted: int
+    updated: int
+    test_bank_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+@activity.defn
+async def ingest_to_bank(input: IngestToBankInput) -> IngestToBankOutput:
+    """Upsert ``input.items`` into the integration's test bank.
+
+    Bank resolution order:
+      1. ``(integration_id, api_name=connector_name)`` if connector_name set.
+      2. The first ``test_bank`` row for the integration, otherwise.
+      3. Auto-create a bank with ``api_name = connector_name or 'custom'``.
+    """
+    from app.database import async_session
+    from app.models import TestBank, TestBankEntity
+    from sqlalchemy import delete as sa_delete, select
+
+    # Normalise items to a list. Single-record callers (`data.transform`
+    # outputs a dict) shouldn't have to wrap.
+    if isinstance(input.items, list):
+        items_list = input.items
+    elif input.items is None:
+        items_list = []
+    else:
+        items_list = [input.items]
+
+    if not input.entity_type:
+        return IngestToBankOutput(
+            success=False, inserted=0, updated=0, error="entity_type is required"
+        )
+
+    async with async_session() as session:
+        # 1) Resolve / create the bank row.
+        bank: Optional[TestBank] = None
+        if input.connector_name:
+            res = await session.execute(
+                select(TestBank).where(
+                    TestBank.integration_id == input.integration_id,
+                    TestBank.api_name == input.connector_name,
+                )
+            )
+            bank = res.scalar_one_or_none()
+        if bank is None:
+            res = await session.execute(
+                select(TestBank).where(
+                    TestBank.integration_id == input.integration_id
+                )
+            )
+            bank = res.scalars().first()
+        if bank is None:
+            bank = TestBank(
+                integration_id=input.integration_id,
+                api_name=input.connector_name or "custom",
+            )
+            session.add(bank)
+            await session.flush()  # need bank.id for the entity rows
+
+        # 2) Optional truncate.
+        if input.replace:
+            await session.execute(
+                sa_delete(TestBankEntity).where(
+                    TestBankEntity.test_bank_id == bank.id,
+                    TestBankEntity.entity_type == input.entity_type,
+                )
+            )
+
+        # 3) Upsert each item by (test_bank_id, entity_type, entity_id).
+        inserted = 0
+        updated = 0
+        for raw in items_list:
+            data = raw if isinstance(raw, dict) else {"value": raw}
+            entity_id = _path_get(data, input.id_path)
+            if entity_id is None:
+                # Skip records with no id — they'd collide on the unique
+                # index and aren't routable from the mock-engine anyway.
+                continue
+            entity_id_str = str(entity_id)
+            res = await session.execute(
+                select(TestBankEntity).where(
+                    TestBankEntity.test_bank_id == bank.id,
+                    TestBankEntity.entity_type == input.entity_type,
+                    TestBankEntity.entity_id == entity_id_str,
+                )
+            )
+            existing = res.scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    TestBankEntity(
+                        test_bank_id=bank.id,
+                        entity_type=input.entity_type,
+                        entity_id=entity_id_str,
+                        data=data,
+                    )
+                )
+                inserted += 1
+            else:
+                existing.data = data
+                updated += 1
+
+        await session.commit()
+
+        return IngestToBankOutput(
+            success=True,
+            inserted=inserted,
+            updated=updated,
+            test_bank_id=bank.id,
+        )

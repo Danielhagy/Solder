@@ -1,0 +1,132 @@
+{
+  "api_name": "zip",
+  "version": "1.0",
+  "_notes": "Hand-authored starter set covering each v1 trigger type (field_value, request_shape, random, manual). Expand to ~30 entries before v1 ships per FullSpec.md § 5.4. Format authoritative — all corpora must conform.",
+  "errors": [
+    {
+      "id": "zip.po.invalid_vendor_ref",
+      "applies_to_routes": [
+        "POST /v1/purchase_orders",
+        "PUT /v1/purchase_orders/{id}"
+      ],
+      "trigger": {
+        "type": "field_value",
+        "field": "vendor_id",
+        "condition": "not_in_test_bank"
+      },
+      "response": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "INVALID_REFERENCE",
+            "message": "Vendor with id '{vendor_id}' not found",
+            "field": "vendor_id"
+          }
+        }
+      },
+      "frequency": {
+        "deterministic": true,
+        "chaos_weight": 0.0
+      },
+      "explanation": "The Zip API rejects POST/PUT to purchase_orders when vendor_id does not match an existing vendor record. The mock returns the same error if the request's vendor_id is not present in the source test bank."
+    },
+    {
+      "id": "zip.po.missing_required_field",
+      "applies_to_routes": [
+        "POST /v1/purchase_orders"
+      ],
+      "trigger": {
+        "type": "request_shape",
+        "rule": "required_field_missing",
+        "fields": ["vendor_id", "line_items"]
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Missing required field: {missing_field}",
+            "field": "{missing_field}"
+          }
+        }
+      },
+      "frequency": {
+        "deterministic": true,
+        "chaos_weight": 0.0
+      },
+      "explanation": "Zip returns 422 when a POST omits a required field. Two are required at create time: vendor_id and line_items."
+    },
+    {
+      "id": "zip.auth.invalid_bearer",
+      "applies_to_routes": ["*"],
+      "trigger": {
+        "type": "request_shape",
+        "rule": "missing_or_malformed_auth_header"
+      },
+      "response": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": "UNAUTHENTICATED",
+            "message": "Missing or invalid bearer token"
+          }
+        }
+      },
+      "frequency": {
+        "deterministic": true,
+        "chaos_weight": 0.0
+      },
+      "explanation": "Every Zip route requires `Authorization: Bearer <token>`. The mock validates the header is present and well-formed; the value is not checked because credentials live in our store, not the mock spec."
+    },
+    {
+      "id": "zip.rate_limit.exceeded",
+      "applies_to_routes": ["*"],
+      "trigger": {
+        "type": "random",
+        "weight_field": "chaos_weight"
+      },
+      "response": {
+        "status": 429,
+        "body": {
+          "error": {
+            "code": "RATE_LIMIT_EXCEEDED",
+            "message": "Too many requests. Retry after {retry_after_seconds} seconds.",
+            "retry_after": 30
+          }
+        },
+        "headers": {
+          "Retry-After": "30"
+        }
+      },
+      "frequency": {
+        "deterministic": false,
+        "chaos_weight": 0.05
+      },
+      "explanation": "Zip rate-limits per-tenant. In chaos mode, the mock fires this with 5% probability so integrations can be tested for retry/backoff behaviour. Off entirely outside chaos mode."
+    },
+    {
+      "id": "zip.po.duplicate_create",
+      "applies_to_routes": [
+        "POST /v1/purchase_orders"
+      ],
+      "trigger": {
+        "type": "manual"
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "code": "DUPLICATE_RESOURCE",
+            "message": "A purchase_order with external_id '{external_id}' already exists",
+            "field": "external_id"
+          }
+        }
+      },
+      "frequency": {
+        "deterministic": true,
+        "chaos_weight": 0.0
+      },
+      "explanation": "Zip enforces uniqueness on external_id when supplied. The mock fires this only when the user explicitly requests it from the test UI — useful for testing dedupe logic without polluting the test bank."
+    }
+  ]
+}

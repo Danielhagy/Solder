@@ -5,6 +5,21 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.integration import RunStatus
 
+# 'sandbox' = synthesise data via mock-engine; 'production' = call the
+# real API via the chosen Connection. Vendor sandbox vs prod is encoded
+# in the Connection (its base_url + label), not as a separate enum here.
+_ALLOWED_ENVIRONMENTS = {"sandbox", "production"}
+
+
+def _validate_environment(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    if v not in _ALLOWED_ENVIRONMENTS:
+        raise ValueError(
+            f"environment must be one of {sorted(_ALLOWED_ENVIRONMENTS)}, got {v!r}"
+        )
+    return v
+
 
 # Integration schemas
 class IntegrationCreate(BaseModel):
@@ -16,6 +31,15 @@ class IntegrationCreate(BaseModel):
     trigger: Optional[dict] = None  # Defaults to {"type":"manual"} in the model
     status: Optional[str] = None  # draft|active|disabled
     is_library: Optional[bool] = False  # Reusable subprocess?
+    # 'sandbox' (synthetic test data via mock-engine) | 'production' (real
+    # API via the chosen Connection's secret + base_url). Defaults to
+    # sandbox so a fresh integration is always safe to run.
+    environment: Optional[str] = None
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _check_environment(cls, v: Any) -> Any:
+        return _validate_environment(v)
 
 
 class IntegrationUpdate(BaseModel):
@@ -28,6 +52,12 @@ class IntegrationUpdate(BaseModel):
     trigger: Optional[dict] = None
     status: Optional[str] = None
     is_library: Optional[bool] = None
+    environment: Optional[str] = None
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _check_environment(cls, v: Any) -> Any:
+        return _validate_environment(v)
 
 
 class IntegrationResponse(BaseModel):
@@ -41,6 +71,7 @@ class IntegrationResponse(BaseModel):
     status: str = "draft"
     trigger: dict = Field(default_factory=lambda: {"type": "manual"})
     is_library: bool = False
+    environment: str = "sandbox"
     created_at: datetime
     updated_at: datetime
 
@@ -107,7 +138,11 @@ class RunCreate(BaseModel):
     """Schema for creating a run."""
 
     integration_id: str
-    input_data: Optional[dict] = None
+    # JSONB column — any JSON-serialisable value. Node pipelines often
+    # produce scalars/lists/strings as their input or final output, so
+    # forcing `dict` here breaks validation on rows seeded by the
+    # node-catalog runtime work.
+    input_data: Optional[Any] = None
     trigger_source: Optional[str] = None  # manual|webhook|schedule|on_event
 
 
@@ -115,7 +150,7 @@ class RunUpdate(BaseModel):
     """Schema for updating a run."""
 
     status: Optional[RunStatus] = None
-    output_data: Optional[dict] = None
+    output_data: Optional[Any] = None
     error_message: Optional[str] = None
     steps: Optional[list] = None
 
@@ -126,8 +161,8 @@ class RunResponse(BaseModel):
     id: str
     integration_id: str
     status: str
-    input_data: Optional[dict]
-    output_data: Optional[dict]
+    input_data: Optional[Any]
+    output_data: Optional[Any]
     error_message: Optional[str]
     steps: list
     started_at: Optional[datetime]

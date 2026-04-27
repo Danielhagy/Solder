@@ -8,6 +8,19 @@
     @apply antialiased font-sans text-surface-900 bg-surface-50 dark:text-surface-50 dark:bg-surface-950;
     font-feature-settings: 'ss01', 'cv11';
   }
+  /*
+   * Reserve scrollbar gutter at the document root so a vertical
+   * scrollbar appearing or disappearing between routes (Dashboard
+   * fits in viewport → no scrollbar; Integrations exceeds it →
+   * scrollbar appears) doesn't shift the `mx-auto` centered content
+   * container. Without this, navigating between sections looks like
+   * the entire page jumps ~8 px sideways even though no animation is
+   * involved — that was the root cause of the "page shifts from
+   * Dashboard to Integrations" symptom, not a transition bug.
+   */
+  html {
+    scrollbar-gutter: stable;
+  }
   code,
   pre {
     @apply font-mono;
@@ -39,6 +52,15 @@
   }
   .btn-ghost {
     @apply bg-transparent text-surface-600 hover:bg-surface-100 active:bg-surface-200 disabled:opacity-60 disabled:cursor-not-allowed dark:text-surface-300 dark:hover:bg-surface-800 dark:active:bg-surface-700;
+  }
+  /*
+   * Forge button — the brand's hot CTA. Reserved for actions that "fire
+   * something off" (Run, Trigger now, Re-run failed). Uses the forge
+   * scale so it speaks the same vocabulary as the canvas's ember field;
+   * sky-blue `btn-primary` is kept for save / confirm / submit.
+   */
+  .btn-forge {
+    @apply bg-forge-600 text-white hover:bg-forge-700 active:bg-forge-800 disabled:opacity-60 disabled:cursor-not-allowed shadow-sm shadow-forge-900/40;
   }
   /* Small square icon button — replaces 5+ ad-hoc close / toggle buttons. */
   .btn-icon {
@@ -94,6 +116,42 @@
     @apply bg-cyan-50 text-cyan-700 ring-cyan-200 dark:bg-cyan-950/40 dark:text-cyan-300 dark:ring-cyan-800/50;
   }
 
+  /*
+   * Reference token chip — rendered inside a ReferenceField overlay.
+   *
+   * The overlay sits on top of an invisible-text textarea and paints
+   * the same characters; tokens (`{{$.…}}`) become inline `.ref-chip`
+   * spans with a Python-syntax-highlighter neon-violet treatment. The
+   * `{` `}` braces stay rendered (so character widths match the
+   * underlying textarea exactly — caret alignment depends on this) but
+   * are dimmed to ~25% so the user reads only the inner expression. A
+   * `box-decoration-break: clone` keeps the rounded background intact
+   * across textarea soft-wraps.
+   */
+  .ref-chip {
+    @apply font-mono cursor-pointer rounded-[3px] bg-violet-100 text-violet-700 ring-1 ring-violet-300/60
+           hover:bg-violet-200 hover:ring-violet-400/70
+           dark:bg-violet-500/[0.18] dark:text-violet-200 dark:ring-violet-400/30
+           dark:hover:bg-violet-500/[0.28] dark:hover:ring-violet-300/50
+           transition-colors;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  /* Width-preserving "hidden" — the chars stay rendered (so the
+     overlay's character count matches the textarea below, keeping the
+     caret aligned) but are invisible. The `{{$.` prefix and `}}` suffix
+     fall under this so the chip reads as just the inner expression. */
+  .ref-chip-hidden {
+    opacity: 0;
+  }
+  .ref-chip-inner {
+    @apply font-medium;
+  }
+  /* When the picker / popover is open for a chip, give it a brighter ring. */
+  .ref-chip[data-open='true'] {
+    @apply ring-2 ring-violet-500/80 dark:ring-violet-300/80;
+  }
+
   /* Alert banners — one shape for error / info surfaces. */
   .alert {
     @apply rounded-md px-3 py-2 text-sm ring-1;
@@ -108,6 +166,68 @@
   /* 1px horizontal rule used inside section headers etc. */
   .hairline {
     @apply h-px bg-surface-200 dark:bg-surface-800;
+  }
+
+  /*
+   * Glass rail — the elevated, translucent surface used by floating chrome
+   * (sidebar / properties panel / topbar / trigger strip) on the Builder.
+   *
+   * Light theme: nearly-opaque white with a soft ring + drop shadow. Dark
+   * theme: a thin sheet of warm-neutral surface-950 over the canvas, which
+   * lets the ember field bleed through as faint heat behind the chrome —
+   * the whole point of layering rather than abutting flat panels. The
+   * `backdrop-blur-md` is what keeps text legible over the moving embers.
+   */
+  .glass-rail {
+    @apply bg-white/85 backdrop-blur-md ring-1 ring-surface-200/60 shadow-rail
+           dark:bg-surface-950/65 dark:ring-white/[0.06] dark:shadow-rail-dark;
+  }
+
+  /*
+   * Wordmark — the lockup used in the global header and the builder topbar.
+   * Slash-star comment opener/closer treats the brand as a code annotation,
+   * which matches Solder's "you're inside a workbench" tone. The display
+   * face plus tighter tracking keeps it distinct from body Inter at the
+   * same size class.
+   */
+  .solder-wordmark {
+    @apply font-display text-[1.0625rem] font-semibold tracking-[-0.02em];
+  }
+  .solder-wordmark-frame {
+    @apply font-mono text-xs text-forge-500/70 dark:text-forge-400/60 select-none;
+  }
+
+  /*
+   * Status pip — small dot rendered on the corner of a node card to signal
+   * configuration / run state at a glance. Six tones map to the lifecycle:
+   *   - idle:        gray, "no run yet"
+   *   - incomplete:  amber, "missing config"
+   *   - ready:       cyan, "configured, untested"
+   *   - running:     forge, animated halo
+   *   - success:     emerald
+   *   - error:       red
+   */
+  .status-pip {
+    @apply inline-block w-2 h-2 rounded-full ring-2 ring-white dark:ring-surface-950;
+  }
+  .status-pip-idle      { @apply bg-surface-300 dark:bg-surface-600; }
+  .status-pip-incomplete{ @apply bg-amber-400; }
+  .status-pip-ready     { @apply bg-cyan-400; }
+  .status-pip-running   { @apply bg-forge-500; box-shadow: 0 0 0 4px rgb(249 115 22 / 0.25); animation: solderPulse 1.4s ease-in-out infinite; }
+  .status-pip-success   { @apply bg-emerald-500; }
+  .status-pip-error     { @apply bg-red-500; }
+
+  /*
+   * Step-number badge — the canonical "this is step N" reference used on
+   * each node card. Anchored top-left of the card, mono+tabular so two-
+   * digit indices line up. Decoupled from chip/eyebrow so we can change
+   * its position without touching either.
+   */
+  .step-badge {
+    @apply inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1
+           rounded-md text-[10px] font-mono tabular-nums font-semibold
+           bg-surface-900/[0.04] text-surface-500 ring-1 ring-surface-900/[0.06]
+           dark:bg-white/5 dark:text-surface-400 dark:ring-white/[0.08];
   }
 }
 
@@ -172,32 +292,102 @@
 .measure-rule::after { @apply right-0; }
 
 /*
- * Canvas surface — deep black workbench.
+ * Discrete scrollbar — the "elegant overlay" replacement for the chunky
+ * 17px Windows / GTK default. Apply `.solder-scroll-thin` to any internal
+ * scrolling pane (sidebars, drawers, properties panel, run plan list).
  *
- * The ember strip overlay (Solder_gif.mp4) sits at the bottom of the canvas
- * with mix-blend-mode: screen, which requires a true black backdrop so the
- * video's dark frame contributes nothing and only the bright fire/embers
- * paint over the surface. Any gradient or non-black wash here would tint
- * the embers and ruin the screen-blend.
+ * Design:
+ *   - 6px wide thumb; transparent track; no rail.
+ *   - At rest: barely-there gray (matches the drafting-paper neutrality —
+ *     the thumb is information, not chrome, and stays out of the way
+ *     unless you reach for it).
+ *   - On panel hover: the thumb intensifies so the scroll affordance is
+ *     obvious before you grab it.
+ *   - On thumb hover: full opacity for confident dragging.
+ *   - Theme-aware in both directions.
+ *
+ * WebKit (Chrome / Edge / Safari) uses `::-webkit-scrollbar*`; Firefox
+ * uses `scrollbar-width` + `scrollbar-color`. Both are covered.
+ */
+.solder-scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(161 161 170 / 0.25) transparent;
+  scrollbar-gutter: stable;
+}
+.solder-scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.solder-scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.solder-scroll-thin::-webkit-scrollbar-thumb {
+  background-color: rgb(161 161 170 / 0.2);
+  border-radius: 3px;
+  transition: background-color 180ms ease;
+}
+.solder-scroll-thin:hover::-webkit-scrollbar-thumb {
+  background-color: rgb(113 113 122 / 0.45);
+}
+.solder-scroll-thin::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(82 82 91 / 0.65);
+}
+.solder-scroll-thin::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.dark .solder-scroll-thin {
+  scrollbar-color: rgb(82 82 91 / 0.45) transparent;
+}
+.dark .solder-scroll-thin::-webkit-scrollbar-thumb {
+  background-color: rgb(82 82 91 / 0.4);
+}
+.dark .solder-scroll-thin:hover::-webkit-scrollbar-thumb {
+  background-color: rgb(113 113 122 / 0.55);
+}
+.dark .solder-scroll-thin::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(161 161 170 / 0.7);
+}
+
+/*
+ * Canvas surface — deep black workbench with a quiet dotted grid for
+ * spatial reference. The grid is drawn at ~24px pitch and very low
+ * contrast so it provides a sense of "this is a designed surface" without
+ * competing with the embers above or the node cards on top. Embers are
+ * additive (`composite: lighter`) so the dot grid composes underneath
+ * cleanly without muddying their glow.
+ *
+ * Dot pattern: a single `radial-gradient` repeated via `background-size`.
+ * Two stops keep the dot crisp; the second `transparent 1.4px` is a tiny
+ * AA buffer so the dot doesn't shimmer at fractional DPRs.
  */
 .solder-canvas-surface,
 .dark .solder-canvas-surface {
   background-color: #000000;
-  background-image: none;
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgb(255 255 255 / 0.05) 1px,
+    transparent 1.4px
+  );
+  background-size: 24px 24px;
 }
 
 /*
- * Embers strip — looped video tiles pinned to the canvas bottom.
- *
- * `screen` blend means the source video's near-black pixels go transparent
- * over our #000 canvas (so we don't see a square video tile boundary),
- * while the bright orange/yellow embers add light on top. The mask fades
- * the strip into the canvas so there's no hard edge where the strip ends.
+ * Blueprint surface — the empty-canvas backdrop. Layers a deeper-contrast
+ * dotted grid plus a faint warm radial wash so the empty workspace feels
+ * like a drafting table, not a void. Pairs with `.frame-corners` and
+ * `.measure-rule` for the full schematic look.
  */
-.solder-embers-strip {
-  mix-blend-mode: screen;
-  -webkit-mask-image: linear-gradient(to top, #000 55%, transparent 100%);
-          mask-image: linear-gradient(to top, #000 55%, transparent 100%);
+.solder-blueprint-surface {
+  background-image:
+    radial-gradient(ellipse 60% 40% at 50% 60%, rgb(249 115 22 / 0.06), transparent 70%),
+    radial-gradient(circle at 1px 1px, rgb(255 255 255 / 0.07) 1px, transparent 1.4px);
+  background-size: auto, 32px 32px;
+}
+
+/* Forge-tinted breathing pulse — used for running-status pip and CTA glow. */
+@keyframes solderPulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgb(249 115 22 / 0.18); }
+  50%      { box-shadow: 0 0 0 6px rgb(249 115 22 / 0.32); }
 }
 
 /* Phantom "future stage" slot — dimmer, dashed, clearly marked as "empty but addable". */
@@ -275,6 +465,32 @@
 @keyframes solderNodeIn {
   from { opacity: 0; transform: scale(0.92); }
   to   { opacity: 1; transform: scale(1); }
+}
+
+/*
+ * Reduced-motion overrides — kill all CSS-driven animations when the
+ * user (or a Playwright test calling `page.emulate_media({reducedMotion:
+ * 'reduce'})`) opts out of motion. Two reasons this matters:
+ *   1. Accessibility: animation triggers vestibular issues for some
+ *      users; the browser's preference is the contract for honouring it.
+ *   2. Test stability: Playwright's actionability checks treat moving
+ *      elements as "not yet stable" and time out. Without this gate the
+ *      scroll-into-view + click cycle can't reliably hit anything that's
+ *      mid-mount-spring or mid-pulse.
+ *
+ * Targets the two sources of perpetual motion: the node mount spring
+ * (`animate-[solderNodeIn_*]` arbitrary class on every NodeCard) and
+ * the running status-pip's pulse halo. The framer-motion scene-zoom
+ * variants already honour `useReducedMotion()` from inside Canvas.tsx
+ * — they're handled component-side and don't need a CSS rule here.
+ */
+@media (prefers-reduced-motion: reduce) {
+  [class*="animate-[solderNodeIn"] {
+    animation: none !important;
+  }
+  .status-pip-running {
+    animation: none !important;
+  }
 }
 
 
