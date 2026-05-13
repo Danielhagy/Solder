@@ -15,11 +15,13 @@ wiring step required for the front-end to see a new connector.
 
 from .base import BaseConnector
 from .hubspot import HubSpotConnector
+from .ramp import RampConnector
 from .zip import ZipConnector
 
 REGISTRY: dict[str, BaseConnector] = {
     "zip": ZipConnector(),
     "hubspot": HubSpotConnector(),
+    "ramp": RampConnector(),
 }
 
 
@@ -27,4 +29,11 @@ def get(name: str) -> BaseConnector | None:
     return REGISTRY.get(name)
 
 
-__all__ = ["BaseConnector", "REGISTRY", "get", "ZipConnector", "HubSpotConnector"]
+__all__ = [
+    "BaseConnector",
+    "REGISTRY",
+    "get",
+    "ZipConnector",
+    "HubSpotConnector",
+    "RampConnector",
+]

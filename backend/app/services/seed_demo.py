@@ -27,10 +27,26 @@ from app.models import (
     MockSession,
     MockSessionWrite,
     MockSpec,
+    OpenAPISpec,
     TestBank,
     TestBankEntity,
 )
 from app.services import connection_crypto
+
+# Bundled OpenAPI specs that ship with Solder. Each entry: (db row name,
+# repo path relative to backend/, source URL for provenance). Loaded once
+# on startup so the wizard ("+ Sandbox from Spec") has something to point
+# at without an outbound fetch — keeps the demo deterministic offline.
+import json
+from pathlib import Path
+
+_BUNDLED_SPECS = (
+    {
+        "name": "Ramp Developer API — Procurement",
+        "path": Path(__file__).resolve().parents[1] / "connectors" / "spec_assets" / "ramp-procurement.json",
+        "url": "https://docs.ramp.com/openapi/developer-api.json",
+    },
+)
 
 
 DEMO_INTEGRATION_NAME = "Mock Engine Demo (Zip)"
@@ -47,6 +63,7 @@ async def seed(db: AsyncSession) -> dict[str, object]:
     can pick it from the editor's connection list.
     """
     connector_ids = await _ensure_connectors(db)
+    await _ensure_bundled_openapi_specs(db)
     integration = await _ensure_integration(db)
     demo_connection = await _ensure_demo_connection(db, connector_ids["zip"])
     bank = await _ensure_bank(db, integration.id)
@@ -93,6 +110,44 @@ async def _ensure_connectors(db: AsyncSession) -> dict[str, str]:
             row.brand_domain = conn.brand_domain
         out[name] = row.id
     return out
+
+
+async def _ensure_bundled_openapi_specs(db: AsyncSession) -> None:
+    """Load each bundled OpenAPI spec into the `openapi_specs` table.
+
+    Idempotent on `name` — re-running rewrites `spec_json` so a fresh
+    pull of an upstream spec gets picked up the next boot. Skips
+    silently if the bundled file is missing (lets test envs that don't
+    ship the spec bundle still boot).
+    """
+    for entry in _BUNDLED_SPECS:
+        path: Path = entry["path"]  # type: ignore[assignment]
+        if not path.exists():
+            continue
+        try:
+            spec_json = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        version = str(spec_json.get("openapi") or spec_json.get("swagger") or "3.0.0")
+        existing = (
+            await db.execute(select(OpenAPISpec).where(OpenAPISpec.name == entry["name"]))
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(
+                OpenAPISpec(
+                    id=str(uuid4()),
+                    name=entry["name"],
+                    url=entry.get("url"),
+                    version=version,
+                    spec_json=spec_json,
+                    parsed_markdown=None,
+                )
+            )
+        else:
+            existing.spec_json = spec_json
+            existing.version = version
+            existing.url = entry.get("url")
+        await db.flush()
 
 
 async def _ensure_integration(db: AsyncSession) -> Integration:

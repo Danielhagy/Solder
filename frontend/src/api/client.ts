@@ -18,6 +18,13 @@ export interface Integration {
   environment?: 'sandbox' | 'production';
   created_at: string;
   updated_at: string;
+  /**
+   * ISO timestamp set when the integration was soft-deleted via DELETE
+   * /api/integrations/{id}. Null/undefined for live rows. The backend
+   * hard-purges these after 30 days (provided no Run rows still
+   * reference them). UI can render "deleted X ago" off this field.
+   */
+  deleted_at?: string | null;
 }
 
 export interface Run {
@@ -81,6 +88,8 @@ export interface Connector {
   metadata_json: Record<string, unknown>;
 }
 
+export type SandboxMode = 'none' | 'vendor' | 'synthetic';
+
 export interface Connection {
   id: string;
   connector_id: string | null;
@@ -88,6 +97,13 @@ export interface Connection {
   auth_scheme: string;
   base_url: string | null;
   config_json: Record<string, unknown>;
+  /** Sandboxes v1: how this connection is served when an integration
+   *  runs in `environment='sandbox'`. */
+  sandbox_mode: SandboxMode;
+  /** Per-mode payload. For 'vendor': `{ base_url, creds_set: bool }`
+   *  (encrypted creds redacted at the API layer). For 'synthetic':
+   *  `{ kb_opt_in, last_primed_at, endpoints: { <path>: {...} } }`. */
+  sandbox_config: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -201,6 +217,25 @@ export const api = {
     return response.json() as Promise<OpenAPISpec>;
   },
   deleteOpenAPISpec: (id: string) => request<void>(`/openapi/${id}`, { method: 'DELETE' }),
+  /** Flat per-operation listing for the "+ Sandbox from Spec" wizard.
+   *  One entry per (method, path) — drives the endpoint checklist
+   *  without re-parsing megabyte specs on the client. */
+  listSpecEndpoints: (specId: string) =>
+    request<{
+      spec_id: string;
+      name: string;
+      version: string;
+      endpoints: Array<{
+        method: string;
+        path: string;
+        operation_id: string | null;
+        summary: string;
+        tags: string[];
+        deprecated: boolean;
+      }>;
+      tags: string[];
+      total: number;
+    }>(`/openapi/${specId}/endpoints`),
 
   buildWithAI: (description: string, openApiSpecId?: string, existingIntegrationId?: string) =>
     request<{ integration_config: IntegrationConfig; explanation: string; suggested_name: string }>(
@@ -242,6 +277,106 @@ export const api = {
       body: JSON.stringify(data)
     }),
   deleteConnection: (id: string) => request<void>(`/connections/${id}`, { method: 'DELETE' }),
+  /** Set or clear a connection's sandbox config (Sandboxes v1).
+   *  - `mode: 'none'` clears any prior config.
+   *  - `mode: 'vendor'` requires `vendor_secrets` (encrypted on receipt);
+   *    `vendor_base_url` is optional.
+   *  - `mode: 'synthetic'` initialises priming state; `kb_opt_in` controls
+   *    cross-customer KB contribution (defaults true server-side). */
+  updateConnectionSandbox: (
+    id: string,
+    body: {
+      mode: SandboxMode;
+      vendor_base_url?: string | null;
+      vendor_secrets?: Record<string, unknown>;
+      kb_opt_in?: boolean;
+    }
+  ) =>
+    request<Connection>(`/connections/${id}/sandbox`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /** Sandboxes v1 OpenAPI ingest. Connection must be in `synthetic` mode.
+   *  Body accepts either `{spec_json}` (paste) or `{openapi_spec_id}`
+   *  (reference a stored spec row). Returns a summary the UI can show. */
+  ingestOpenAPIIntoSandbox: (
+    id: string,
+    body: {
+      spec_json?: unknown;
+      openapi_spec_id?: string;
+      /** Optional `"METHOD /path"` allowlist — when set, only those
+       *  operations land in the connection's mock spec. Stashed on
+       *  `sandbox_config.endpoint_allowlist` for round-tripping. */
+      endpoint_allowlist?: string[];
+    }
+  ) =>
+    request<{
+      routes_added: number;
+      entities_seeded: number;
+      endpoints_seen: number;
+      skipped: string[];
+    }>(`/connections/${id}/sandbox/ingest-openapi`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** Sandboxes v1 AI-synthesised records. Persists `count` records of
+   *  `entity_type` into the connection's TestBank. Falls back to a
+   *  deterministic generator when Anthropic is unavailable. */
+  synthesizeSandboxRecords: (
+    id: string,
+    body: { entity_type: string; count?: number; variant?: 'full' | 'half' | 'minimal' }
+  ) =>
+    request<{
+      created: number;
+      used_fallback: boolean;
+      error: string | null;
+      examples: Record<string, unknown>[];
+    }>(`/connections/${id}/sandbox/synthesize`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** Sandboxes v1 bank summary — per-entity-type record counts + schema. */
+  getSandboxBank: (id: string) =>
+    request<{
+      entity_types: Array<{ name: string; count: number; schema_keys: string[] }>;
+      total: number;
+      schema: Record<string, Record<string, unknown>>;
+    }>(`/connections/${id}/sandbox/bank`),
+  /** Sandboxes v1 errors tab — corpus + observed audit aggregation. */
+  getSandboxErrors: (id: string) =>
+    request<{
+      api_name: string | null;
+      corpus: Array<{
+        id: string;
+        applies_to_routes?: string[];
+        trigger?: Record<string, unknown>;
+        response?: { status?: number; body?: unknown };
+        explanation?: string;
+      }>;
+      observed: Array<{
+        path: string;
+        status: number;
+        error_injected: string | null;
+        count: number;
+        last_seen: string | null;
+      }>;
+    }>(`/connections/${id}/sandbox/errors`),
+  /** Sandboxes v1 active probe — read-only against prod creds. */
+  primeSandbox: (id: string) =>
+    request<{
+      endpoints_probed: number;
+      successes: number;
+      failures: number;
+      sample_count_total: number;
+      outcomes: Array<{
+        path: string;
+        method: string;
+        success: boolean;
+        sample_count: number;
+        fields_observed: number;
+        error: string | null;
+      }>;
+    }>(`/connections/${id}/sandbox/prime`, { method: 'POST' }),
 
   listConnectionTypes: () => request<ConnectionType[]>('/connection-types'),
 

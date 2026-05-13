@@ -109,3 +109,52 @@ async def delete_openapi_spec(spec_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.delete(spec)
     await db.commit()
+
+
+@router.get("/{spec_id}/endpoints")
+async def list_spec_endpoints(spec_id: str, db: AsyncSession = Depends(get_db)):
+    """Flat per-operation listing for the "Sandbox from Spec" wizard.
+
+    Returns one row per (method, path) pair so the frontend can render
+    a checklist without re-parsing the full spec on the client. Tags
+    let the wizard offer prefilter chips ("Bills", "Vendors", ...).
+    """
+    result = await db.execute(select(OpenAPISpec).where(OpenAPISpec.id == spec_id))
+    spec = result.scalar_one_or_none()
+    if not spec:
+        raise HTTPException(status_code=404, detail="OpenAPI spec not found")
+
+    paths = (spec.spec_json or {}).get("paths", {}) or {}
+    out: list[dict] = []
+    seen_tags: set[str] = set()
+    for path, methods in paths.items():
+        if not isinstance(methods, dict):
+            continue
+        for method_name, op in methods.items():
+            if method_name.upper() not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                continue
+            if not isinstance(op, dict):
+                continue
+            tags = op.get("tags") or []
+            for t in tags:
+                if isinstance(t, str):
+                    seen_tags.add(t)
+            out.append(
+                {
+                    "method": method_name.upper(),
+                    "path": path,
+                    "operation_id": op.get("operationId"),
+                    "summary": op.get("summary") or "",
+                    "tags": [t for t in tags if isinstance(t, str)],
+                    "deprecated": bool(op.get("deprecated", False)),
+                }
+            )
+    out.sort(key=lambda e: (e["path"], e["method"]))
+    return {
+        "spec_id": str(spec.id),
+        "name": spec.name,
+        "version": spec.version,
+        "endpoints": out,
+        "tags": sorted(seen_tags),
+        "total": len(out),
+    }
