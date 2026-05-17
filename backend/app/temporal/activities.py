@@ -8,6 +8,9 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 from temporalio import activity
 
+from app.runtime.interpolate import splice_path_refs_repr
+from app.runtime.path import get_at as _runtime_get_at
+
 
 @dataclass
 class PaginationConfig:
@@ -43,7 +46,11 @@ class PaginationConfig:
 
 @dataclass
 class APICallInput:
-    """Input for API call activity."""
+    """Input for API call activity.
+
+    ``follow_redirects`` / ``verify`` were added with the HTTP node v2 editor
+    so users can flip redirect-following and TLS verification per-request.
+    Defaults preserve historical behaviour (follow on, verify on)."""
 
     method: str
     url: str
@@ -52,6 +59,8 @@ class APICallInput:
     auth: Optional[dict] = None
     timeout: int = 30
     pagination: Optional[PaginationConfig] = None
+    follow_redirects: bool = True
+    verify: bool = True
 
 
 @dataclass
@@ -126,25 +135,15 @@ async def execute_api_call(input: APICallInput) -> APICallOutput:
     activity.logger.info(f"Executing API call: {input.method} {input.url}")
 
     try:
-        async with httpx.AsyncClient(timeout=input.timeout) as client:
-            # Prepare headers
-            headers = input.headers or {}
-
-            # Handle authentication
-            if input.auth:
-                auth_type = input.auth.get("type", "")
-                if auth_type == "bearer":
-                    headers["Authorization"] = f"Bearer {input.auth.get('token', '')}"
-                elif auth_type == "basic":
-                    import base64
-                    credentials = f"{input.auth.get('username', '')}:{input.auth.get('password', '')}"
-                    encoded = base64.b64encode(credentials.encode()).decode()
-                    headers["Authorization"] = f"Basic {encoded}"
-                elif auth_type == "api_key":
-                    key_name = input.auth.get("name", "X-API-Key")
-                    key_location = input.auth.get("in", "header")
-                    if key_location == "header":
-                        headers[key_name] = input.auth.get("value", "")
+        async with httpx.AsyncClient(
+            timeout=input.timeout,
+            follow_redirects=input.follow_redirects,
+            verify=input.verify,
+        ) as client:
+            # Auth handling lives in `_apply_auth` so this activity and
+            # `execute_paginated_api_call` apply identical bearer/basic/api_key
+            # rules — one place to update when a new scheme lands.
+            headers = _apply_auth(input.headers or {}, input.auth)
 
             # Make the request
             response = await client.request(
@@ -208,26 +207,14 @@ def _parse_link_next(header: str) -> Optional[str]:
 
 
 def _path_get(obj: Any, path: str) -> Any:
-    """Walk a JSONPath-ish expression like ``$.foo.bar``. ``$`` = whole object."""
+    """Walk a JSONPath-ish expression like ``$.foo.bar``. ``$`` = whole object.
+
+    Thin shim over `app.runtime.path.get_at` — retained because callers
+    inside this module pass the result through their own None-handling.
+    """
     if obj is None:
         return None
-    if not path or path == "$":
-        return obj
-    trimmed = path.lstrip("$").lstrip(".")
-    if not trimmed:
-        return obj
-    current: Any = obj
-    for part in trimmed.split("."):
-        if current is None:
-            return None
-        if isinstance(current, dict):
-            current = current.get(part)
-        elif isinstance(current, list) and part.isdigit():
-            idx = int(part)
-            current = current[idx] if 0 <= idx < len(current) else None
-        else:
-            return None
-    return current
+    return _runtime_get_at(obj, path)
 
 
 def _apply_auth(headers: dict[str, str], auth: Optional[dict]) -> dict[str, str]:
@@ -279,7 +266,11 @@ async def execute_paginated_api_call(input: APICallInput) -> APICallOutput:
     last_status = 0
 
     try:
-        async with httpx.AsyncClient(timeout=input.timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=input.timeout,
+            follow_redirects=input.follow_redirects,
+            verify=input.verify,
+        ) as client:
             while pages < p.max_pages:
                 if p.mode == "page":
                     query_override = {p.page_param: str(page_num)}
@@ -746,15 +737,35 @@ for _mod in list(allow_set):
     except Exception:
         pass
 
+# Public stdlib C-extensions that SAFE pure-compute modules depend on
+# internally (base64 → binascii, hashlib → struct, urllib.parse →
+# unicodedata, etc). They're kept wired into their parent module's
+# namespace so `base64.b64encode` works, but the import filter below
+# still blocks user-level `import binascii` since they're not in SAFE.
+# Add here only modules that are pure-compute (no I/O / network).
+_KEEP_HELPERS = {"binascii", "struct", "unicodedata"}
+
 # Scrub module-typed attributes that point at blocked modules. Stdlib
 # modules sometimes alias their internal `os` / `sys` deps as `_os` /
 # `_sys` for their own use — stripping those external aliases prevents
 # `random._os.system(...)` style escapes without breaking the module's
 # own internal use of its imports (which goes through fresh lookups,
-# not reflective attribute access). Iterate `sys.modules` not allow_set
-# so we cover transitively-loaded private deps too.
+# not reflective attribute access).
+#
+# What we keep:
+#  - modules in allow_set (the user-facing safe API)
+#  - private C-extensions whose root starts with `_` (e.g. `_sre`,
+#    `_hashlib`, `_csv`, `_blake2`) — the import guard blocks user-level
+#    `import _sre` so these are unreachable via the user's API; we just
+#    have to keep them wired internally so `re.match` etc still work.
+#  - explicit public helpers in _KEEP_HELPERS.
+#
+# What we strip:
+#  - public-named modules aliased privately into stdlib namespaces (the
+#    `random._os` escape vector). `os` is public, not in allow_set, not
+#    private → stripped.
 import types as _types
-def _scrub_blocked_refs(mod, allow):
+def _scrub_blocked_refs(mod, allow, keep):
     for _name in list(vars(mod)):
         if _name.startswith("__") and _name.endswith("__"):
             continue
@@ -764,18 +775,21 @@ def _scrub_blocked_refs(mod, allow):
             continue
         if isinstance(_v, _types.ModuleType):
             _root = (_v.__name__ or "").split(".")[0]
-            if _root and _root not in allow:
-                try:
-                    delattr(mod, _name)
-                except Exception:
-                    pass
+            if not _root:
+                continue
+            if _root in allow or _root in keep or _root.startswith("_"):
+                continue
+            try:
+                delattr(mod, _name)
+            except Exception:
+                pass
 for _mod_name in list(sys.modules):
     _m = sys.modules.get(_mod_name)
     if _m is None:
         continue
     _root = _mod_name.split(".")[0]
     if _root in allow_set:
-        _scrub_blocked_refs(_m, allow_set)
+        _scrub_blocked_refs(_m, allow_set, _KEEP_HELPERS)
 
 def guarded_import(name, *args, **kwargs):
     root = name.split(".")[0]
@@ -861,47 +875,15 @@ print(json.dumps({
 '''
 
 
-def _splice_path_refs(source: str, data: Any) -> str:
-    """Replace `{{$.path}}` tokens in a Python source string with the
-    `repr()` of the value at that path in `data`.
-
-    The point: the user writes references inline in their source the
-    same way they would in a URL or transform expression — picker
-    grammar, no separate "Variables" UI to fill in. After substitution
-    the source is plain Python whose literal values were determined at
-    runtime. `repr()` always produces a valid Python literal for any
-    JSON-shaped value (primitives, lists, dicts, None, True, False),
-    so the result parses cleanly.
-
-    Tokens inside string literals are also replaced — that's
-    intentional, matches user intent ("show me 'name' = `'Alice'`")
-    rather than trying to be clever about string boundaries. The
-    `repr` of a string includes its quotes, so embedded substitutions
-    nest correctly: `f"hi {{$.name}}"` → `f"hi 'Alice'"` (probably not
-    what users want; `f"hi {x}"` with `x = {{$.name}}` is the right
-    pattern for f-strings — but that's a docs issue, not a code one).
+def _splice_path_refs(
+    source: str,
+    data: Any,
+    trigger_input: Any = None,
+) -> str:
+    """Replace `{{$.path}}` tokens with the `repr()` of the resolved
+    value. Thin shim over `app.runtime.interpolate.splice_path_refs_repr`.
     """
-    import re as _re
-
-    def replace(m: "_re.Match[str]") -> str:
-        path = m.group(1).strip()
-        if not path or path == "$":
-            return repr(data)
-        path = path.lstrip("$.")
-        cur: Any = data
-        for part in path.split("."):
-            if isinstance(cur, dict):
-                cur = cur.get(part)
-            elif isinstance(cur, list) and part.isdigit():
-                idx = int(part)
-                cur = cur[idx] if 0 <= idx < len(cur) else None
-            else:
-                return repr(None)
-            if cur is None:
-                return repr(None)
-        return repr(cur)
-
-    return _re.sub(r"\{\{([^}]+)\}\}", replace, source)
+    return splice_path_refs_repr(source, data, trigger_input=trigger_input)
 
 
 @activity.defn
@@ -910,6 +892,7 @@ async def execute_python_sandbox(
     data: Any,
     timeout_ms: int = 30000,
     allow_imports: Optional[list[str]] = None,
+    trigger_input: Any = None,
 ) -> dict:
     """Run user-supplied Python in a subprocess sandbox.
 
@@ -935,8 +918,11 @@ async def execute_python_sandbox(
     """
     # Splice path refs BEFORE handing off to the subprocess — keeps the
     # bootstrap simple (no template engine in the sandboxed child) and
-    # lets us reuse `data` reads in this same parent process.
-    source = _splice_path_refs(source or "", data)
+    # lets us reuse `data` reads in this same parent process. The
+    # trigger_input arg lets `{{$.trigger.<path>}}` refs resolve against
+    # the run's input payload regardless of how `data` has evolved
+    # downstream.
+    source = _splice_path_refs(source or "", data, trigger_input=trigger_input)
     import asyncio
     import sys as _sys
 
@@ -1040,8 +1026,12 @@ async def resolve_connector_request(
     """Resolve a connector op into a concrete HTTP request shape.
 
     Looks at the parent integration's `environment`:
-      - 'sandbox': route through `/api/mock/{integration_id}/{connector}/{path}`
-        and skip secret decryption (the mock-engine accepts any bearer).
+      - 'sandbox': route through the mock-engine. Sandboxes v1 prefers
+        the per-connection route `/api/mock/c/{connection_id}/{path}`
+        when the node has a connection bound; falls back to the legacy
+        `/api/mock/{integration_id}/{connector}/{path}` until cleanup.
+        Either way secrets aren't decrypted — the mock-engine just
+        checks that *some* bearer is present.
       - 'production': read the chosen connection, decrypt the secret, apply
         the auth scheme, and return the real headers/query.
 
@@ -1082,10 +1072,13 @@ async def resolve_connector_request(
                 getattr(settings, "api_base_url", None)
                 or "http://localhost:8000"
             ).rstrip("/")
-            url = (
-                f"{api_base}/api/mock/{input.integration_id}/"
-                f"{input.connector_name}{path}"
-            )
+            if input.connection_id:
+                url = f"{api_base}/api/mock/c/{input.connection_id}{path}"
+            else:
+                url = (
+                    f"{api_base}/api/mock/{input.integration_id}/"
+                    f"{input.connector_name}{path}"
+                )
             # Mock-engine just checks "some" bearer is present.
             return ConnectorResolveOutput(
                 success=True,

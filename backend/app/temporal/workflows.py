@@ -36,6 +36,26 @@ with workflow.unsafe.imports_passed_through():
     # Local helper used inline by `state.set` / `state.get`. Lives in pure.py
     # next to the rest of the JSONPath conventions.
     from app.runtime.pure import _get_at as _state_get_at
+    # Canonical path resolver — replaces the workflow's own `_walk_path`
+    # and the python sandbox's inner walker.
+    from app.runtime.path import walk as _runtime_walk
+    # Canonical request-body renderer — handles the structured-dict
+    # path AND the new raw-template-string path that ReferenceField
+    # backs in the editor.
+    from app.runtime.interpolate import (
+        render_request_body as _render_request_body,
+        TemplateBodyError as _TemplateBodyError,
+    )
+    # HTTP node v2 — pure helpers shared with the per-node test runner so
+    # `_execute_api_call` and `node_test_executor._http_request` interpret
+    # the same KvRow / HttpBody / HttpAuth shapes identically.
+    from app.runtime.http_config import (
+        auth_mode_of as _http_auth_mode_of,
+        extract_path_for_resolver as _http_extract_path,
+        flatten_kv_rows as _flatten_kv_rows,
+        legacy_auth_from_v2 as _legacy_auth_from_v2,
+        normalize_http_body as _normalize_http_body,
+    )
     # Static set of registered connectors — used by `_dispatch_node` to
     # detect that a node's `kind` belongs to a connector op (e.g. 'zip',
     # 'hubspot') without colliding with built-in dispatch keys like
@@ -127,6 +147,17 @@ class _StopRun(BaseException):
         self.reason = reason
 
 
+def _walk_path(root: Any, path: str) -> Any:
+    """Walk a dot-separated path against a JSON-ish root.
+
+    Thin shim over `app.runtime.path.walk`. Retained as a local symbol
+    because `_get_value_at_path` does its own ``$.trigger`` routing
+    before delegating, so it wants the no-stripping variant rather than
+    the full ``get_at``.
+    """
+    return _runtime_walk(root, path)
+
+
 def _node_dispatch_key(node: dict) -> str:
     """Return `kind.action` for a node, accepting either the new shape or legacy `type`."""
     kind = node.get("kind")
@@ -171,6 +202,13 @@ class IntegrationRunWorkflow:
         # dispatch time so the resolve activity can route to the right
         # mock-engine bucket and look up `environment` from the row.
         self._integration_id: str = input.integration_id
+
+        # Trigger payload — the `input_data` the user (or webhook) passed
+        # in. Captured separately so `{{$.trigger.<path>}}` references
+        # resolve from this regardless of how `current_data` evolves
+        # downstream. See `_get_value_at_path` and the python sandbox's
+        # splice helper.
+        self._trigger_input: Any = input.input_data
 
         steps: list[dict] = []
         current_data: Any = input.input_data
@@ -754,7 +792,9 @@ class IntegrationRunWorkflow:
             # Source-level template substitution lives inside the activity
             # (`_splice_path_refs`) — the user writes `{{$.path}}` tokens
             # inline in the Python source and they get spliced in as
-            # `repr()`-encoded literals before compile.
+            # `repr()`-encoded literals before compile. `trigger_input`
+            # lets `{{$.trigger.<path>}}` refs resolve regardless of
+            # stage so the run's seed payload stays reachable.
             envelope = await workflow.execute_activity(
                 execute_python_sandbox,
                 args=[
@@ -762,11 +802,22 @@ class IntegrationRunWorkflow:
                     current_data,
                     timeout_ms,
                     allow,
+                    self._trigger_input,
                 ],
                 # Activity timeout sits a couple seconds above the in-script
                 # timeout so we never race the sandbox's own kill path.
                 start_to_close_timeout=timedelta(milliseconds=timeout_ms + 5000),
             )
+            # Forward `print()` output to the run drawer via the
+            # `_step_extras` side-channel — `_build_step_record` and the
+            # legacy success/failure paths both fold extras into the
+            # step record. Writing BEFORE the raise below ensures stdout
+            # is preserved even when the script crashes after printing
+            # (the failure step record then carries both `error` and
+            # `stdout`, matching the per-node Test runner's behaviour).
+            stdout = envelope.get("stdout") if isinstance(envelope, dict) else None
+            if isinstance(stdout, str) and stdout:
+                self._step_extras[node["id"]] = {"stdout": stdout}
             error = envelope.get("error") if isinstance(envelope, dict) else None
             if error:
                 kind = (envelope.get("error_kind") or "runtime") if isinstance(envelope, dict) else "runtime"
@@ -865,11 +916,22 @@ class IntegrationRunWorkflow:
             )
 
         # Body interpolation happens once here; the per-call activity does not
-        # re-interpolate. Any `headers` declared on the node are merged after
-        # the resolved auth headers so user overrides win.
-        body = config.get("body")
-        if body:
-            body = self._interpolate_dict(body, data if isinstance(data, dict) else {})
+        # re-interpolate. `_render_request_body` handles both the structured
+        # dict path (existing) and the raw-template string path that the
+        # editor's "Template" mode emits. Any `headers` declared on the node
+        # are merged after the resolved auth headers so user overrides win.
+        try:
+            body = _render_request_body(
+                config.get("body"),
+                data if isinstance(data, dict) else {},
+                trigger_input=self._trigger_input,
+            )
+        except _TemplateBodyError as e:
+            raise APICallError(
+                f"connector {connector_name}.{endpoint_path}: {e}",
+                error_kind="permanent",
+                status_code=None,
+            )
         merged_headers = {**resolved.headers, **(config.get("headers") or {})}
 
         # Pagination is honoured exactly like http.request — the catalog
@@ -904,16 +966,113 @@ class IntegrationRunWorkflow:
     async def _execute_api_call(self, config: dict, data: dict) -> Any:
         """Execute an API call node.
 
-        Branches on ``config.pagination.mode``: ``none`` (or absent) routes to the
+        Supports both v1 (dict headers, string/dict body, no connectionId) and
+        v2 (KvRow[] headers + params, HttpBody discriminator, connectionId,
+        auth.mode override, settings.{timeout, followRedirects, verify}).
+
+        Branches on ``config.pagination.mode``: ``none`` routes to the
         original single-shot ``execute_api_call`` activity; any other mode routes
         to ``execute_paginated_api_call`` and returns the concatenated item list
         as the flat payload for downstream nodes.
         """
-        # Interpolate variables in config
-        url = self._interpolate(config.get("url", ""), data)
-        body = config.get("body")
-        if body:
-            body = self._interpolate_dict(body, data)
+        # --- Interpolate URL + merge structured query params (v2) ---
+        url_raw = self._interpolate(config.get("url", ""), data)
+        params_dict = _flatten_kv_rows(config.get("params"))
+        if params_dict:
+            # Interpolate each value too so `{{$.…}}` works in query values.
+            params_dict = {
+                k: self._interpolate(v, data) for k, v in params_dict.items()
+            }
+            url_raw = self._merge_query_params(url_raw, params_dict)
+
+        # --- Body — accept v2 HttpBody discriminator or legacy shape ---
+        body_in = _normalize_http_body(config.get("body"))
+        try:
+            body = _render_request_body(
+                body_in,
+                data,
+                trigger_input=self._trigger_input,
+            )
+        except _TemplateBodyError as e:
+            raise APICallError(
+                f"http.request: {e}",
+                error_kind="permanent",
+                status_code=None,
+            )
+
+        # --- Headers — KvRow[] or legacy dict ---
+        user_headers = _flatten_kv_rows(config.get("headers"))
+        for k, v in list(user_headers.items()):
+            user_headers[k] = self._interpolate(v, data)
+
+        # --- Auth override + Connection resolution ---
+        # `auth.mode = 'inherit'` (default) defers to the resolved Connection.
+        # Any other mode overrides that resolved auth.
+        raw_auth_cfg = config.get("auth")
+        auth_override = _legacy_auth_from_v2(raw_auth_cfg)
+        auth_mode = (
+            raw_auth_cfg.get("mode") if isinstance(raw_auth_cfg, dict) else None
+        )
+
+        connection_id = (
+            config.get("connectionId")
+            or config.get("credential_id")
+            or config.get("connection_id")
+            or None
+        )
+
+        resolved_url = url_raw
+        resolved_headers: dict[str, str] = {}
+        resolved_query: dict[str, str] = {}
+        if connection_id:
+            resolved = await workflow.execute_activity(
+                resolve_connector_request,
+                ConnectorResolveInput(
+                    integration_id=self._integration_id,
+                    connector_name="",  # bare HTTP — no connector op
+                    endpoint_path=_http_extract_path(url_raw),
+                    connection_id=connection_id,
+                ),
+                start_to_close_timeout=timedelta(seconds=15),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            if not resolved.success:
+                raise APICallError(
+                    f"http.request: connection {connection_id}: {resolved.error}",
+                    error_kind="permanent",
+                    status_code=None,
+                )
+            # Absolute URL on the node overrides the Connection's base_url.
+            if not url_raw.startswith(("http://", "https://")):
+                resolved_url = resolved.url
+            resolved_headers = dict(resolved.headers or {})
+            resolved_query = dict(resolved.query or {})
+
+        # Final URL: resolved + any auth-scheme query params.
+        final_url = (
+            self._merge_query_params(resolved_url, resolved_query)
+            if resolved_query
+            else resolved_url
+        )
+
+        # Final headers: connection auth first, then user-supplied (user wins
+        # on collision EXCEPT when the user is explicitly inheriting — then
+        # Connection's Authorization should not be silently overwritten by
+        # a stray user header).
+        if auth_mode == "none":
+            # Strip any resolved Authorization explicitly.
+            resolved_headers.pop("Authorization", None)
+            resolved_headers.pop("authorization", None)
+        final_headers = {**resolved_headers, **user_headers}
+
+        # Override-mode auth wins over resolved auth.
+        final_auth = auth_override if auth_mode not in (None, "inherit") else None
+
+        # --- Settings ---
+        settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
+        timeout_s = int(settings.get("timeoutSeconds", config.get("timeout", 30)) or 30)
+        follow_redirects = bool(settings.get("followRedirects", True))
+        verify = bool(settings.get("rejectUnauthorized", True))
 
         raw_pagination = config.get("pagination") or {}
         pagination_mode = raw_pagination.get("mode", "none") if isinstance(raw_pagination, dict) else "none"
@@ -937,12 +1096,14 @@ class IntegrationRunWorkflow:
                 execute_paginated_api_call,
                 APICallInput(
                     method=config.get("method", "GET"),
-                    url=url,
-                    headers=config.get("headers", {}),
+                    url=final_url,
+                    headers=final_headers,
                     body=body,
-                    auth=config.get("auth"),
-                    timeout=config.get("timeout", 30),
+                    auth=final_auth,
+                    timeout=timeout_s,
                     pagination=pagination,
+                    follow_redirects=follow_redirects,
+                    verify=verify,
                 ),
                 start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(
@@ -968,11 +1129,13 @@ class IntegrationRunWorkflow:
             execute_api_call,
             APICallInput(
                 method=config.get("method", "GET"),
-                url=url,
-                headers=config.get("headers", {}),
+                url=final_url,
+                headers=final_headers,
                 body=body,
-                auth=config.get("auth"),
-                timeout=config.get("timeout", 30),
+                auth=final_auth,
+                timeout=timeout_s,
+                follow_redirects=follow_redirects,
+                verify=verify,
             ),
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(
@@ -1061,20 +1224,26 @@ class IntegrationRunWorkflow:
         return obj
 
     def _get_value_at_path(self, data: Any, path: str) -> Any:
-        """Get value at a dot-separated path."""
+        """Resolve a `$.…`-style path against the workflow's data scope.
+
+        The default scope is `data` (the upstream step's output), but two
+        prefixes route elsewhere:
+          - `$.trigger`         → the run's input_data (`self._trigger_input`)
+          - `$.trigger.<rest>`  → walks `<rest>` against the trigger payload
+
+        Picker tokens like `{{$.trigger.user.name}}` resolve through this
+        path. Other prefixes (plain keys, list indices) walk `data` as
+        before. `_walk_path` is a stateless cursor walk reused by both
+        branches so the special-cases stay tight.
+        """
         if not path or path == "$":
             return data
-
-        path = path.lstrip("$.")
-        current = data
-        for part in path.split("."):
-            if isinstance(current, dict):
-                current = current.get(part)
-            elif isinstance(current, list) and part.isdigit():
-                current = current[int(part)]
-            else:
-                return None
-        return current
+        norm = path.lstrip("$.")
+        if norm == "trigger":
+            return self._trigger_input
+        if norm.startswith("trigger."):
+            return _walk_path(self._trigger_input, norm[len("trigger.") :])
+        return _walk_path(data, norm)
 
 
 @workflow.defn

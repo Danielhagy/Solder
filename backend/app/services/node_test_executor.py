@@ -26,10 +26,22 @@ Out of scope for v1 (return a clear "not testable in isolation" error):
 
 from __future__ import annotations
 
-import re
 import time as _time
 from typing import Any, Optional
 
+from app.runtime.interpolate import (
+    interpolate_value as _interpolate_canonical,
+    render_request_body,
+    TemplateBodyError,
+)
+from app.runtime.http_config import (
+    auth_mode_of as _http_auth_mode_of,
+    extract_path_for_resolver as _http_extract_path,
+    flatten_kv_rows as _http_flatten_kv_rows,
+    legacy_auth_from_v2 as _http_legacy_auth_from_v2,
+    normalize_http_body as _http_normalize_body,
+)
+from app.runtime.path import get_at
 from app.runtime.pure import PURE_DISPATCH
 from app.temporal import activities
 
@@ -38,64 +50,30 @@ class NodeNotTestable(Exception):
     """Raised when the test feature can't run this node in isolation."""
 
 
-# ── Template resolution ────────────────────────────────────────────────
-# Mirrors the workflow's `_interpolate` / `_interpolate_dict` /
-# `_get_value_at_path` trio so configs that reference the input data
-# (`{{$.user_id}}`, `{{$.body.email}}`) work in the test runner without
-# the user having to bake concrete values into the editor first.
-
-_TEMPLATE_RE = re.compile(r"\{\{([^}]+)\}\}")
+# In test mode the run's `input_data` IS the trigger payload — passing
+# it through as both `data` and `trigger_input` makes `$.trigger.<rest>`
+# refs resolve against the same dict picker tokens point at, without
+# the test runner tracking a separate trigger scope.
 
 
 def _value_at_path(data: Any, path: str) -> Any:
-    """Dot-separated traversal: `$`, `$.foo`, `$.items.0.name`."""
-    if not path or path == "$":
-        return data
-    path = path.lstrip("$.")
-    current: Any = data
-    for part in path.split("."):
-        if isinstance(current, dict):
-            current = current.get(part)
-        elif isinstance(current, list) and part.isdigit():
-            idx = int(part)
-            current = current[idx] if 0 <= idx < len(current) else None
-        else:
-            return None
-    return current
-
-
-def _interpolate_str(template: str, data: Any) -> str:
-    def replace(m: "re.Match[str]") -> str:
-        expr = m.group(1).strip()
-        v = _value_at_path(data, expr)
-        return "" if v is None else str(v)
-
-    return _TEMPLATE_RE.sub(replace, template)
+    """Test-runner path resolution. ``$.trigger.<rest>`` aliases
+    ``$.<rest>`` because both root at ``data`` here.
+    """
+    return get_at(data, path, trigger_input=data)
 
 
 def _interpolate(value: Any, data: Any) -> Any:
-    """Recursively interpolate `{{$.path}}` refs in nested dict/list/str.
-
-    Bare strings whose entire content is a single `{{…}}` token resolve
-    to the *typed* value at that path (so `{{$.id}}` yields the int, not
-    `"42"`); strings with mixed content (`prefix-{{$.id}}`) coerce to
-    string. Matches the workflow's behaviour.
+    """Recursively interpolate `{{$.path}}` refs. See
+    `app.runtime.interpolate.interpolate_value` for semantics.
     """
-    if isinstance(value, str):
-        m = _TEMPLATE_RE.fullmatch(value.strip())
-        if m:
-            return _value_at_path(data, m.group(1).strip())
-        return _interpolate_str(value, data)
-    if isinstance(value, dict):
-        return {k: _interpolate(v, data) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_interpolate(v, data) for v in value]
-    return value
+    return _interpolate_canonical(value, data, trigger_input=data)
 
 
 async def execute_node(
     node: dict,
     input_data: Any,
+    integration_id: Optional[str] = None,
 ) -> dict:
     """Run one node sync. Returns a step-record-shaped envelope:
 
@@ -137,7 +115,7 @@ async def execute_node(
     extras: dict[str, Any] = {}
 
     try:
-        output = await _run(dispatch_key, cfg, input_data, extras)
+        output = await _run(dispatch_key, cfg, input_data, extras, integration_id)
         return {
             "ok": True,
             "kind": dispatch_key,
@@ -183,14 +161,18 @@ async def execute_node(
 
 
 async def _run(
-    dispatch_key: str, cfg: dict, data: Any, extras: dict[str, Any]
+    dispatch_key: str,
+    cfg: dict,
+    data: Any,
+    extras: dict[str, Any],
+    integration_id: Optional[str] = None,
 ) -> Any:
     # Pure ops: stdlib-only, deterministic, fast.
     if dispatch_key in PURE_DISPATCH:
         return PURE_DISPATCH[dispatch_key](cfg, data)
 
     if dispatch_key == "http.request":
-        return await _http_request(cfg, data)
+        return await _http_request(cfg, data, integration_id)
 
     if dispatch_key == "transform.map":
         out = await activities.execute_transform(
@@ -219,8 +201,8 @@ async def _run(
         )
     if dispatch_key == "time.now":
         return await activities.get_current_time(
+            fmt=str(cfg.get("format") or "iso"),
             tz=str(cfg.get("tz") or "UTC"),
-            output=str(cfg.get("output") or "iso"),
         )
 
     if dispatch_key == "code.python":
@@ -231,11 +213,16 @@ async def _run(
         # compile. Stdout from `print()` calls is written into `extras`
         # so the caller's envelope can surface it for the editor's
         # output panel.
+        # In test mode the run's `input_data` IS the trigger payload by
+        # construction (the user picks a past run or pastes a sample), so
+        # forward it as `trigger_input` too — `{{$.trigger.<path>}}` refs
+        # resolve the same way as in a real run.
         env = await activities.execute_python_sandbox(
             source=str(cfg.get("source") or ""),
             data=data,
             timeout_ms=int(cfg.get("timeout_ms") or 30000),
             allow_imports=list(cfg.get("allow_imports") or []),
+            trigger_input=data,
         )
         stdout = env.get("stdout") if isinstance(env, dict) else None
         has_stdout = isinstance(stdout, str) and bool(stdout)
@@ -287,33 +274,112 @@ async def _run(
     )
 
 
-async def _http_request(cfg: dict, data: Any) -> Any:
-    """Wrap `execute_api_call` for one-shot tests. Pagination disabled in
+async def _http_request(
+    cfg: dict, data: Any, integration_id: Optional[str] = None
+) -> Any:
+    """Wrap ``execute_api_call`` for one-shot tests. Pagination disabled in
     the test runner — testing a single request is the point.
 
-    `data` isn't used to template the URL/body in v1 (the workflow does
-    that via `_resolve_template`); for the test runner, the user is
-    expected to fill in concrete values in the editor before clicking
-    Test. A future pass can wire template resolution here too.
+    Mirrors ``workflows._execute_api_call`` for the v2 config shape:
+    flattens KvRow[] headers + params, normalises HttpBody, honours
+    ``auth.mode`` override, and resolves the bound Connection (when
+    ``integration_id`` is supplied) so test calls route through the same
+    sandbox / production path real runs do. With no ``integration_id`` the
+    Connection step is skipped — useful for ad-hoc public-API smoke tests.
     """
     method = str(cfg.get("method") or "GET").upper()
-    url = str(cfg.get("url") or "")
-    if not url:
+    url_raw = _interpolate(str(cfg.get("url") or ""), data)
+    if not url_raw:
         raise Exception("http.request: missing 'url'")
-    headers = cfg.get("headers") or {}
-    body = cfg.get("body")
-    auth = cfg.get("auth")
-    timeout = int(cfg.get("timeout") or 30)
+
+    # --- Structured query params -> merge into URL ---
+    params_dict = _http_flatten_kv_rows(cfg.get("params"))
+    if params_dict:
+        params_dict = {k: _interpolate(v, data) for k, v in params_dict.items()}
+        url_raw = _merge_query(url_raw, params_dict)
+
+    # --- Body — v2 HttpBody discriminator or legacy shape ---
+    try:
+        body = render_request_body(
+            _http_normalize_body(cfg.get("body")), data, trigger_input=data
+        )
+    except TemplateBodyError as e:
+        err = Exception(f"http.request: {e}")
+        setattr(err, "error_kind", "permanent")
+        raise err
+
+    # --- Headers — KvRow[] or legacy dict ---
+    user_headers = _http_flatten_kv_rows(cfg.get("headers"))
+    user_headers = {k: _interpolate(v, data) for k, v in user_headers.items()}
+
+    # --- Auth + Connection resolution ---
+    raw_auth = cfg.get("auth")
+    auth_override = _http_legacy_auth_from_v2(raw_auth)
+    auth_mode = _http_auth_mode_of(raw_auth)
+    connection_id = (
+        cfg.get("connectionId")
+        or cfg.get("credential_id")
+        or cfg.get("connection_id")
+        or None
+    )
+
+    resolved_url = url_raw
+    resolved_headers: dict[str, str] = {}
+    resolved_query: dict[str, str] = {}
+    if connection_id and integration_id:
+        resolved = await activities.resolve_connector_request(
+            activities.ConnectorResolveInput(
+                integration_id=integration_id,
+                connector_name="",
+                endpoint_path=_http_extract_path(url_raw),
+                connection_id=connection_id,
+            )
+        )
+        if not resolved.success:
+            err = Exception(
+                f"http.request: connection {connection_id}: {resolved.error}"
+            )
+            setattr(err, "error_kind", "permanent")
+            raise err
+        if not url_raw.startswith(("http://", "https://")):
+            resolved_url = resolved.url
+        resolved_headers = dict(resolved.headers or {})
+        resolved_query = dict(resolved.query or {})
+
+    final_url = (
+        _merge_query(resolved_url, resolved_query) if resolved_query else resolved_url
+    )
+
+    if auth_mode == "none":
+        resolved_headers.pop("Authorization", None)
+        resolved_headers.pop("authorization", None)
+    final_headers = {**resolved_headers, **user_headers}
+    final_auth = auth_override if auth_mode not in (None, "inherit") else None
+
+    # --- Settings ---
+    settings = cfg.get("settings") if isinstance(cfg.get("settings"), dict) else {}
+    timeout_s = int(settings.get("timeoutSeconds", cfg.get("timeout", 30)) or 30)
+    follow_redirects = bool(settings.get("followRedirects", True))
+    verify = bool(settings.get("rejectUnauthorized", True))
+
+    # Reconstruct exactly what the activity will put on the wire so the
+    # Response drawer's cURL sub-tab can render the real request, not the
+    # response headers echoed back at us. Mask known-sensitive header
+    # values; preview only — the user's clipboard never sees the raw token.
+    wire_headers = activities._apply_auth(final_headers, final_auth)
+    masked_request_headers = _mask_sensitive_headers(wire_headers)
 
     out = await activities.execute_api_call(
         activities.APICallInput(
             method=method,
-            url=url,
-            headers=headers if isinstance(headers, dict) else {},
-            body=body if isinstance(body, dict) else None,
-            auth=auth if isinstance(auth, dict) else None,
-            timeout=timeout,
+            url=final_url,
+            headers=final_headers,
+            body=body if isinstance(body, (dict, list)) else None,
+            auth=final_auth,
+            timeout=timeout_s,
             pagination=None,
+            follow_redirects=follow_redirects,
+            verify=verify,
         )
     )
     if not out.success:
@@ -325,7 +391,45 @@ async def _http_request(cfg: dict, data: Any) -> Any:
         "status_code": out.status_code,
         "headers": out.headers,
         "body": out.body,
+        "request_url": final_url,
+        "request_headers": masked_request_headers,
     }
+
+
+# Bearer / Basic / API-key values get the middle replaced with `•••` so the
+# user can confirm an Authorization header is being sent without exposing the
+# raw secret in the cURL preview (still copyable, just masked).
+_SENSITIVE_HEADER_KEYS = {"authorization", "proxy-authorization", "x-api-key"}
+
+
+def _mask_sensitive_headers(
+    headers: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Return header pairs with secret values masked. Preserves order in
+    insertion form so the cURL preview reads top-to-bottom the way the
+    user typed them."""
+    masked: list[tuple[str, str]] = []
+    for k, v in headers.items():
+        if k.lower() in _SENSITIVE_HEADER_KEYS and v:
+            if " " in v:
+                scheme, _, _ = v.partition(" ")
+                masked.append((k, f"{scheme} •••"))
+            else:
+                masked.append((k, "•••"))
+        else:
+            masked.append((k, v))
+    return masked
+
+
+def _merge_query(url: str, extra: dict[str, str]) -> str:
+    """Merge query params into a URL. Existing keys win on collision (the
+    user-typed URL is the source of truth)."""
+    if not extra:
+        return url
+    sep = "&" if "?" in url else "?"
+    from urllib.parse import urlencode
+
+    return f"{url}{sep}{urlencode(extra, doseq=True)}"
 
 
 # ── Input derivation from a previous run ────────────────────────────────

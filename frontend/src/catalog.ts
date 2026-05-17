@@ -316,6 +316,10 @@ export function idPrefixFor(kind: string, action: string): string {
   // chosen — keeps step ids stable across operation changes.
   const kindLevel = KIND_TO_ID_PREFIX[`${kind}.`];
   if (kindLevel) return kindLevel;
+  // Family node dropped without an action picked yet — derive a prefix
+  // from the kind alone so the step ID is stable until the user picks
+  // an action and the per-action prefix takes over.
+  if (!action) return kind.toUpperCase().replace(/[^A-Z0-9]/g, '_').replace(/_+/g, '_');
   return action.toUpperCase().replace(/[^A-Z0-9]/g, '_').replace(/_+/g, '_');
 }
 
@@ -332,6 +336,130 @@ export const GROUPS: NodeGroup[] = [
   'Process',
   'Output'
 ];
+
+/**
+ * Family metadata — one entry per `kind` that exposes ≥2 actions in the
+ * palette. The Sidebar collapses each family's per-action tiles into a
+ * single tile that drops a `{kind, action: ''}` node; the editor then
+ * renders an action picker, configures the chosen action's defaults, and
+ * mounts the existing per-action editor unchanged.
+ *
+ * Single-action kinds (`http.request`, `code.python`, `transform.map`,
+ * `output.passthrough`, `process.call`) are NOT families — they keep
+ * their existing palette tile, since there's no action to choose.
+ *
+ * Logic is intentionally excluded: branch/switch/loop are containers
+ * with structural side-effects (seedBranches, container scope), and
+ * collapsing them would muddle the conceptual gap between "leaf" and
+ * "container" actions in the palette. Authoring `Loop` and `If/Else`
+ * as distinct first-class tiles keeps that boundary visible.
+ */
+export interface FamilyMeta {
+  kind: string;
+  group: NodeGroup;
+  label: string;
+  description: string;
+  icon: string;
+  chip: string;
+  accent: string;
+}
+
+export const FAMILIES: FamilyMeta[] = [
+  // Data group — three families fold ~14 tiles into 3.
+  {
+    kind: 'data',
+    group: 'Data',
+    label: 'Data shape',
+    description: 'filter · sort · pick · omit · rename · unique',
+    icon: '⊞',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  {
+    kind: 'math',
+    group: 'Data',
+    label: 'Math',
+    description: 'calc · round',
+    icon: '∑',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  {
+    kind: 'str',
+    group: 'Data',
+    label: 'String',
+    description: 'concat · split · replace · trim · case',
+    icon: 'Aa',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  // Format group — collapses 7 tiles into 1.
+  {
+    kind: 'format',
+    group: 'Format',
+    label: 'Format',
+    description: 'encode · decode · hash · CSV',
+    icon: '⇄',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  // State / Time / AI — each kind already has its own group; the family
+  // is a 1:1 with the group. Tile shows up as the only entry.
+  {
+    kind: 'state',
+    group: 'State',
+    label: 'State',
+    description: 'set · get · ULID · UUID · random',
+    icon: '◧',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  {
+    kind: 'time',
+    group: 'Time',
+    label: 'Time',
+    description: 'now · parse · format · add · diff',
+    icon: '◷',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  },
+  {
+    kind: 'ai',
+    group: 'AI',
+    label: 'AI',
+    description: 'prompt · classify · extract · summarise',
+    icon: '✦',
+    chip: 'bg-surface-100 text-surface-700 ring-surface-200 dark:bg-surface-800 dark:text-surface-300 dark:ring-surface-700',
+    accent: 'border-l-surface-400'
+  }
+];
+
+/** Set of `kind` strings that participate in family-mode palette tiles. */
+export const FAMILY_KIND_SET: Set<string> = new Set(FAMILIES.map((f) => f.kind));
+
+/** Lookup family metadata for a given kind. */
+export function familyForKind(kind: string): FamilyMeta | undefined {
+  return FAMILIES.find((f) => f.kind === kind);
+}
+
+/** Catalog entries (per-action) within a given family kind. */
+export function actionsForKind(kind: string): CatalogEntry[] {
+  return CATALOG.filter((e) => e.kind === kind && e.action);
+}
+
+/**
+ * Default config for a (kind, action) pair. Used by the action picker
+ * to seed the node's config when the user picks an action — same shape
+ * the palette would have shipped if the user had dropped the per-action
+ * tile directly.
+ */
+export function defaultConfigFor(
+  kind: string,
+  action: string
+): Record<string, unknown> {
+  const entry = CATALOG.find((e) => e.kind === kind && e.action === action);
+  return entry ? { ...entry.defaultConfig } : {};
+}
 
 /*
  * Catalog chip palette.
@@ -365,10 +493,21 @@ export const CATALOG: CatalogEntry[] = [
     chip: CHIP_LEAF,
     accent: 'border-l-surface-400',
     defaultConfig: {
+      // HTTP node v2 — see editors/http/http.types.ts.
+      schemaVersion: 2,
+      connectionId: null,
       method: 'GET',
       url: '',
-      headers: {},
-      body: null,
+      params: [],
+      headers: [],
+      body: { mode: 'none', contentType: null },
+      auth: { mode: 'inherit' },
+      settings: {
+        timeoutSeconds: 30,
+        followRedirects: true,
+        rejectUnauthorized: true,
+        sandboxOverride: 'auto'
+      },
       pagination: {
         mode: 'none',
         page_param: 'page',
@@ -1525,11 +1664,33 @@ export function lookupCatalog(kind: string, action: string): CatalogEntry {
   // at config time), fall back to the kind-level entry so saved nodes
   // with `action: 'list_vendors'` still render the correct icon, label,
   // and group instead of the unhelpful FALLBACK.
-  return (
-    CATALOG.find((e) => e.kind === kind && e.action === action) ??
-    CATALOG.find((e) => e.kind === kind && e.action === '') ??
-    FALLBACK
-  );
+  const exact = CATALOG.find((e) => e.kind === kind && e.action === action);
+  if (exact) return exact;
+  const kindLevel = CATALOG.find((e) => e.kind === kind && e.action === '');
+  if (kindLevel) return kindLevel;
+  // Family kinds with no action chosen yet: synthesise a catalog entry
+  // from the FamilyMeta so the NodeCard renders the family's icon/label
+  // and a "pick action" preview instead of the generic Unknown chip.
+  const family = familyForKind(kind);
+  if (family) {
+    return {
+      kind: family.kind,
+      action: '',
+      group: family.group,
+      label: family.label,
+      description: family.description,
+      icon: family.icon,
+      chip: family.chip,
+      accent: family.accent,
+      defaultConfig: {},
+      preview: () => 'pick action',
+      category: 'leaf',
+      tier: 1,
+      outputShape: 'passthrough',
+      sandboxBehavior: 'identical'
+    };
+  }
+  return FALLBACK;
 }
 
 /** DOM key used for both CSS class suffix and data-testid. */
@@ -1659,21 +1820,27 @@ export function defaultContainerLabel(node: {
   return null;
 }
 
-function lastJsonPathSegment(path: string): string | null {
-  // Strip leading `$.` and any `[*]` / `[N]` selectors.
+/**
+ * Strip a leading `$.` and any `[N]` / `[*]` selector, then return the
+ * last dot-separated segment. Used by the catalog's auto-naming and by
+ * `LoopFrame` to derive a singular noun from an `over` path.
+ */
+export function lastJsonPathSegment(path: string): string | null {
   const cleaned = path.replace(/^\$\.?/, '').replace(/\[[^\]]*\]/g, '');
   const parts = cleaned.split('.').filter(Boolean);
   return parts.length ? parts[parts.length - 1] : null;
 }
 
-function humanise(token: string): string {
+export function humanise(token: string): string {
   return token.replace(/[_-]+/g, ' ').trim();
 }
 
-function singularise(noun: string): string {
-  // Cheap English singulariser — good enough for path segments. Only kicks
-  // in on common plural endings; users can always override with an explicit
-  // label if the auto-derived one is wrong.
+/**
+ * Cheap English singulariser — good enough for path segments. Only
+ * kicks in on common plural endings; users can always override with an
+ * explicit label if the auto-derived one is wrong.
+ */
+export function singularise(noun: string): string {
   if (/(ses|xes|zes|ches|shes)$/.test(noun)) return noun.slice(0, -2);
   if (/ies$/.test(noun)) return noun.slice(0, -3) + 'y';
   if (/s$/.test(noun) && !/ss$/.test(noun)) return noun.slice(0, -1);

@@ -381,7 +381,14 @@ export const api = {
   listConnectionTypes: () => request<ConnectionType[]>('/connection-types'),
 
   // ── Per-node test runner ──
-  testNode: (data: { node: Record<string, unknown>; input_data?: unknown }) =>
+  testNode: (data: {
+    node: Record<string, unknown>;
+    input_data?: unknown;
+    /** Required for http.request tests that bind a Connection — the test
+     *  path uses the integration's environment (sandbox vs production)
+     *  to decide whether to route through the mock-engine or hit prod. */
+    integration_id?: string;
+  }) =>
     request<{
       ok: boolean;
       kind: string;

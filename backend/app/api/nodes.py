@@ -46,6 +46,14 @@ class NodeTestIn(BaseModel):
         default=None,
         description="JSON value handed to the node as `current_data`.",
     )
+    integration_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Owning integration UUID. Required for http.request tests that "
+            "bind a Connection (so the test routes through the same sandbox "
+            "/ production resolver real runs do)."
+        ),
+    )
 
 
 class NodeTestOut(BaseModel):
@@ -70,7 +78,9 @@ async def test_node(payload: NodeTestIn) -> NodeTestOut:
             status.HTTP_400_BAD_REQUEST,
             detail="node.kind is required",
         )
-    result = await node_test_executor.execute_node(payload.node, payload.input_data)
+    result = await node_test_executor.execute_node(
+        payload.node, payload.input_data, integration_id=payload.integration_id
+    )
     return NodeTestOut(**result)
 
 

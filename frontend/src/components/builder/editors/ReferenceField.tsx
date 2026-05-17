@@ -114,7 +114,11 @@ export default function ReferenceField({
   ariaLabel,
   testId
 }: ReferenceFieldProps) {
-  const fieldRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
+  // Always a textarea. `singleLine` now means "row=1, Enter is blocked, the
+  // textarea auto-grows as the content wraps." The previous <input> swap
+  // broke caret alignment — input doesn't wrap, the overlay does, so the
+  // caret stayed pinned to row 1 while wrapped glyphs ran below it.
+  const fieldRef = useRef<HTMLTextAreaElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   // When non-null, the inspect popover is showing for the chip whose
@@ -163,8 +167,14 @@ export default function ReferenceField({
   }
 
   function handleKeyDown(
-    e: React.KeyboardEvent<HTMLTextAreaElement | HTMLInputElement>
+    e: React.KeyboardEvent<HTMLTextAreaElement>
   ) {
+    // Single-line mode: swallow Enter so URL / cursor-path / items-path
+    // fields can't sneak a literal `\n` into the value.
+    if (singleLine && e.key === 'Enter') {
+      e.preventDefault();
+      return;
+    }
     if (e.key === '{') {
       setTimeout(openPicker, 0);
     }
@@ -184,6 +194,17 @@ export default function ReferenceField({
   useLayoutEffect(() => {
     handleScroll();
   }, [value]);
+
+  // Auto-grow the textarea so wrapped content stays visible and the caret
+  // can land on the new line. Without this, `rows={1}` would clip after
+  // one wrap and the caret would dive below the visible area. Multi-line
+  // mode also benefits when the user types past the initial `rows`.
+  useLayoutEffect(() => {
+    const el = fieldRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [value, singleLine, rows]);
 
   // Esc closes the inspect popover (mirrors how the picker dismisses).
   useEffect(() => {
@@ -239,11 +260,15 @@ export default function ReferenceField({
   }`;
 
   // The textarea keeps `.input` styling (border, focus ring) — the
-  // overlay layers on top with an absolute fill.
+  // overlay layers on top with an absolute fill. `resize-none` +
+  // `overflow-hidden` lets the JS auto-grow above own the vertical
+  // height without a scrollbar fighting it. `overflow-wrap-anywhere`
+  // matches the overlay's `break-words` so long URLs / tokens wrap at
+  // the same character index in both layers.
   const sharedProps = {
-    ref: fieldRef as React.Ref<HTMLTextAreaElement & HTMLInputElement>,
+    ref: fieldRef,
     value,
-    onChange: (e: React.ChangeEvent<HTMLTextAreaElement | HTMLInputElement>) =>
+    onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
       onChange(e.currentTarget.value),
     onKeyDown: handleKeyDown,
     onScroll: handleScroll,
@@ -253,17 +278,16 @@ export default function ReferenceField({
     spellCheck: false,
     // `caret-current` keeps the caret visible even though the text is
     // transparent. Right-padding leaves room for the `{·}` icon button.
-    className: `input ${sharedShape} pr-9 caret-surface-900 dark:caret-surface-50`,
-    style: { color: 'transparent' as const }
+    className: `input ${sharedShape} pr-9 caret-surface-900 dark:caret-surface-50 resize-none overflow-hidden`,
+    style: {
+      color: 'transparent' as const,
+      overflowWrap: 'anywhere' as const,
+    },
   };
 
   return (
     <div className="relative">
-      {singleLine ? (
-        <input type="text" {...sharedProps} />
-      ) : (
-        <textarea {...sharedProps} rows={rows} />
-      )}
+      <textarea {...sharedProps} rows={singleLine ? 1 : rows} />
 
       {/*
        * Overlay — paints the visible glyphs. `aria-hidden` because the
@@ -276,7 +300,8 @@ export default function ReferenceField({
       <div
         ref={overlayRef}
         aria-hidden="true"
-        className={`pointer-events-none absolute inset-0 ${sharedShape} pr-9 overflow-hidden whitespace-pre-wrap break-words text-surface-900 dark:text-surface-50`}
+        className={`pointer-events-none absolute inset-0 ${sharedShape} pr-9 overflow-hidden whitespace-pre-wrap text-surface-900 dark:text-surface-50`}
+        style={{ overflowWrap: 'anywhere' }}
       >
         {segments.length === 0 || (segments.length === 1 && !value) ? (
           // Empty value — let the textarea's own `placeholder` show.

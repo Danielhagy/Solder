@@ -1110,7 +1110,8 @@ function IngestOpenAPIModal({
         zIndex: 60,
         display: 'grid',
         placeItems: 'center',
-        background: 'rgb(31 27 23 / 0.6)',
+        background: 'rgb(0 0 0 / 0.55)',
+        backdropFilter: 'blur(2px)',
         padding: 16,
       }}
       data-testid="sandbox-ingest-modal"
@@ -1122,14 +1123,15 @@ function IngestOpenAPIModal({
           maxWidth: 620,
           maxHeight: '90vh',
           overflowY: 'auto',
-          background: 'var(--surface-100)',
-          border: '1px solid var(--surface-300)',
+          background: 'var(--surface-900)',
+          border: '1px solid var(--rule)',
           borderRadius: 8,
           padding: 22,
           display: 'flex',
           flexDirection: 'column',
           gap: 14,
-          color: 'var(--surface-900)',
+          color: 'var(--surface-50)',
+          boxShadow: '0 18px 48px rgb(0 0 0 / 0.4)',
         }}
       >
         <Eyebrow>INGEST OPENAPI</Eyebrow>
@@ -1160,10 +1162,10 @@ function IngestOpenAPIModal({
             fontFamily: '"JetBrains Mono", monospace',
             fontSize: 12,
             padding: '10px 12px',
-            background: 'var(--surface-50)',
-            border: '1px solid var(--surface-300)',
+            background: 'var(--container-fill)',
+            border: '1px solid var(--rule)',
             borderRadius: 4,
-            color: 'var(--surface-900)',
+            color: 'var(--surface-50)',
             outline: 'none',
             resize: 'vertical',
           }}
@@ -1240,8 +1242,8 @@ function IngestOpenAPIModal({
                   letterSpacing: '0.08em',
                   textTransform: 'uppercase',
                   background: 'transparent',
-                  color: 'var(--surface-500)',
-                  border: '1px solid var(--surface-300)',
+                  color: 'var(--surface-300)',
+                  border: '1px solid var(--rule)',
                   padding: '9px 14px',
                   borderRadius: 4,
                   cursor: busy ? 'not-allowed' : 'pointer',
