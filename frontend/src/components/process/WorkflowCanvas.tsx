@@ -207,36 +207,60 @@ export default function WorkflowCanvas({ onOpenMatching, particleAnchor }: Props
   }, [drag, updateDoc]);
 
   // ── Arrow routing ───────────────────────────────────────────────────
+  // Flows whose source AND target live in the SAME lane (intra-lane) get
+  // suppressed from the SVG layer — drawing a freeform path through the
+  // card stack is incoherent. The inline match node + per-card "feeds
+  // into" rail (rendered separately) carry that signal instead.
   const arrows = useMemo(() => {
-    return doc.flows.map((flow) => {
-      const src = objectRectsById[flow.from];
-      const tgt = objectRectsById[flow.to];
-      if (!src || !tgt) return null;
-      const sx = src.x + src.w;
-      const sy = src.y + src.h / 2;
-      const tx = tgt.x;
-      const ty = tgt.y + tgt.h / 2;
-      // Obstacle list = lanes other than source/target lanes
-      const obstacles = doc.systems
-        .filter((s) => s.id !== src.obj.system && s.id !== tgt.obj.system)
-        .map((s) => {
-          const lp = lanePositions[s.id];
-          return lp ? { x: lp.x, y: lp.y, w: LANE_WIDTH, h: laneHeight } : null;
-        })
-        .filter(Boolean) as { x: number; y: number; w: number; h: number }[];
+    return doc.flows
+      .filter((flow) => {
+        const src = doc.objects.find((o) => o.id === flow.from);
+        const tgt = doc.objects.find((o) => o.id === flow.to);
+        return src && tgt && src.system !== tgt.system;
+      })
+      .map((flow) => {
+        const src = objectRectsById[flow.from];
+        const tgt = objectRectsById[flow.to];
+        if (!src || !tgt) return null;
+        const sx = src.x + src.w;
+        const sy = src.y + src.h / 2;
+        const tx = tgt.x;
+        const ty = tgt.y + tgt.h / 2;
+        const obstacles = doc.systems
+          .filter((s) => s.id !== src.obj.system && s.id !== tgt.obj.system)
+          .map((s) => {
+            const lp = lanePositions[s.id];
+            return lp ? { x: lp.x, y: lp.y, w: LANE_WIDTH, h: laneHeight } : null;
+          })
+          .filter(Boolean) as { x: number; y: number; w: number; h: number }[];
+        const path = routeBezier({ x: sx, y: sy }, { x: tx, y: ty }, obstacles);
+        const midpoint = { x: (sx + tx) / 2, y: (sy + ty) / 2 };
+        return { flow, path, from: { x: sx, y: sy }, to: { x: tx, y: ty }, midpoint, srcKind: src.obj.kind };
+      });
+  }, [doc.flows, doc.systems, doc.objects, objectRectsById, lanePositions, laneHeight]);
 
-      const path = routeBezier({ x: sx, y: sy }, { x: tx, y: ty }, obstacles);
-      const midpoint = { x: (sx + tx) / 2, y: (sy + ty) / 2 };
-      return {
-        flow,
-        path,
-        from: { x: sx, y: sy },
-        to: { x: tx, y: ty },
-        midpoint,
-        srcKind: src.obj.kind,
-      };
-    });
-  }, [doc.flows, doc.systems, objectRectsById, lanePositions, laneHeight]);
+  // Intra-lane "feeds into" rails — one per source card that has any
+  // intra-lane outbound flow. Renders as a small dashed rail on the
+  // card's right edge with a "↓ N" chip pointing down. Lets non-IT
+  // readers see "this feeds something later in the same lane" without
+  // looking at a freeform path crossing the column.
+  const intraLaneFeeds = useMemo(() => {
+    const out: Array<{ sourceObjectId: string; targetObjectIds: string[]; flowIds: string[] }> = [];
+    const bySource = new Map<string, { targetIds: string[]; flowIds: string[] }>();
+    for (const f of doc.flows) {
+      const src = doc.objects.find((o) => o.id === f.from);
+      const tgt = doc.objects.find((o) => o.id === f.to);
+      if (!src || !tgt || src.system !== tgt.system) continue;
+      const entry = bySource.get(src.id) || { targetIds: [], flowIds: [] };
+      entry.targetIds.push(tgt.id);
+      entry.flowIds.push(f.id);
+      bySource.set(src.id, entry);
+    }
+    for (const [sourceObjectId, { targetIds, flowIds }] of bySource) {
+      out.push({ sourceObjectId, targetObjectIds: targetIds, flowIds });
+    }
+    return out;
+  }, [doc.flows, doc.objects]);
 
   // ── Particle animation position ─────────────────────────────────────
   const particlePos = useMemo<Point | null>(() => {
@@ -311,11 +335,28 @@ export default function WorkflowCanvas({ onOpenMatching, particleAnchor }: Props
               onPointerDown={(e) => startDragLane(sys.id, e)}
               onSelect={() => setSelection({ kind: 'system', id: sys.id })}
             >
-              {sysObjects.map((obj, i) => {
+              {sysObjects.map((obj) => {
                 // Render inline match node ABOVE the target card if this lane owns it
                 const isMatchTarget = hasMatch && matchInfo?.targetObjectId === obj.id;
+                // Inbound cadence — the cadence of any incoming cross-lane
+                // flow gives the card its "what happens" story line
+                const inboundFlow = doc.flows.find((f) => f.to === obj.id);
+                const inputCount = doc.flows.filter((f) => f.to === obj.id).length;
+                const feedsMatch = doc.flows.some(
+                  (f) => f.from === obj.id && f.role === '3-way match',
+                );
+                // Intra-lane feed rail on the right edge?
+                const feed = intraLaneFeeds.find((x) => x.sourceObjectId === obj.id);
                 return (
-                  <div key={obj.id} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div
+                    key={obj.id}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 8,
+                      position: 'relative',
+                    }}
+                  >
                     {isMatchTarget && (
                       <InlineMatchNode
                         inputCount={matchInfo.inputCount}
@@ -326,7 +367,16 @@ export default function WorkflowCanvas({ onOpenMatching, particleAnchor }: Props
                       obj={obj}
                       isSelected={selection.kind === 'object' && selection.id === obj.id}
                       onSelect={() => setSelection({ kind: 'object', id: obj.id })}
+                      inboundCadence={inboundFlow?.cadence}
+                      feedsMatch={feedsMatch}
+                      inputCount={obj.kind === 'computed' ? inputCount : undefined}
                     />
+                    {feed && (
+                      <IntraLaneFeedRail
+                        targetCount={feed.targetObjectIds.length}
+                        active={selection.kind === 'object' && selection.id === obj.id}
+                      />
+                    )}
                   </div>
                 );
               })}
@@ -520,6 +570,64 @@ function StartEndMarker({
       >
         {label}
       </span>
+    </div>
+  );
+}
+
+
+/** Intra-lane feed rail — sits between a source card and the inline
+ *  match node (or the next consumer in the same lane). Replaces the
+ *  freeform SVG path that was cutting through the lane's middle.
+ *  Visual: dashed forge rail with a "↓ feeds N" chip. */
+function IntraLaneFeedRail({ targetCount, active }: { targetCount: number; active: boolean }) {
+  const tone = active ? 'var(--forge-500)' : 'var(--surface-600)';
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        marginTop: -2,
+        marginBottom: -2,
+        pointerEvents: 'none',
+      }}
+      aria-hidden
+    >
+      <span
+        style={{
+          flex: 1,
+          maxWidth: 100,
+          height: 0,
+          borderTop: `1.5px dashed ${tone}`,
+          opacity: active ? 1 : 0.5,
+        }}
+      />
+      <span
+        style={{
+          fontFamily: '"JetBrains Mono", monospace',
+          fontSize: 9.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+          color: tone,
+          background: 'var(--surface-900)',
+          border: `1px solid ${tone}`,
+          borderRadius: 999,
+          padding: '1px 6px',
+          opacity: active ? 1 : 0.7,
+        }}
+      >
+        ↓ feeds {targetCount > 1 ? `${targetCount}` : 'next'}
+      </span>
+      <span
+        style={{
+          flex: 1,
+          maxWidth: 100,
+          height: 0,
+          borderTop: `1.5px dashed ${tone}`,
+          opacity: active ? 1 : 0.5,
+        }}
+      />
     </div>
   );
 }

@@ -1,14 +1,18 @@
 /*
  * ObjectCard — one entity card inside a swimlane.
  *
- * 188×64. Kind glyph + label. Meta row shows kind, field count, sample
- * count. Left accent color depends on `kind` (primary/computed = forge,
- * mirror = primary-500, reference = violet-400).
+ * Procurement-vocab icon (regex-mapped from label) + label header,
+ * one-line plain-English STORY ("8 active POs · webhook on .approved"),
+ * compact metadata foot. Left accent color depends on `kind`.
+ *
+ * Right edge intentionally exposes a 2px space for the intra-lane
+ * "feeds into" rail rendered by WorkflowCanvas.
  */
 import type { ObjectNode, ObjectKind } from '@/lib/process-diagram';
+import { iconForLabel, storyForObject } from '@/lib/procurement-icons';
 
-const CARD_WIDTH = 188;
-const CARD_HEIGHT = 64;
+const CARD_WIDTH = 196; // was 188 — slight bump for the story row
+const CARD_HEIGHT = 80; // was 64 — accommodates the new story line
 
 function accentForKind(kind: ObjectKind): string {
   switch (kind) {
@@ -29,6 +33,13 @@ export interface ObjectCardProps {
   isSelected: boolean;
   /** True if this card is being hovered as a flow source/target candidate. */
   isFlowEndpoint?: boolean;
+  /** Cadence of the inbound flow this card receives (e.g. "webhook + 15m").
+   *  Drives the plain-English story line. */
+  inboundCadence?: string;
+  /** True when this card is the source of a flow feeding the 3-way match. */
+  feedsMatch?: boolean;
+  /** True when this card is the merge target of multiple flows (computed). */
+  inputCount?: number;
   onSelect: () => void;
   onHandlePointerDown?: (side: 'left' | 'right', e: React.PointerEvent) => void;
 }
@@ -37,10 +48,22 @@ export default function ObjectCard({
   obj,
   isSelected,
   isFlowEndpoint = false,
+  inboundCadence,
+  feedsMatch,
+  inputCount,
   onSelect,
   onHandlePointerDown,
 }: ObjectCardProps) {
   const accent = accentForKind(obj.kind);
+  const icon = iconForLabel(obj.label, obj.kind);
+  const story = storyForObject({
+    kind: obj.kind,
+    label: obj.label,
+    sample: obj.sample,
+    inboundCadence,
+    feedsMatch,
+    inputCount,
+  });
   return (
     <div
       role="button"
@@ -74,19 +97,23 @@ export default function ObjectCard({
         transition: 'box-shadow 180ms, border-color 180ms',
         outline: isFlowEndpoint ? `2px dashed ${accent}` : 'none',
         outlineOffset: 2,
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'space-between',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span
           aria-hidden
           style={{
-            fontFamily: '"JetBrains Mono", monospace',
-            fontSize: 13,
-            width: 18,
-            color: accent,
+            fontSize: 16,
+            width: 20,
+            display: 'inline-grid',
+            placeItems: 'center',
+            // emoji are colored — no need for an accent override
           }}
         >
-          {obj.glyph || '◷'}
+          {icon}
         </span>
         <span
           style={{
@@ -97,6 +124,7 @@ export default function ObjectCard({
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
+            flex: 1,
           }}
         >
           {obj.label}
@@ -104,11 +132,27 @@ export default function ObjectCard({
       </div>
       <div
         style={{
-          marginTop: 4,
+          fontFamily: 'Inter, system-ui, sans-serif',
+          fontSize: 11,
+          color: 'var(--surface-300)',
+          lineHeight: 1.35,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          display: '-webkit-box',
+          WebkitBoxOrient: 'vertical',
+          WebkitLineClamp: 1,
+        }}
+        title={story}
+      >
+        {story}
+      </div>
+      <div
+        style={{
           fontFamily: '"JetBrains Mono", monospace',
-          fontSize: 10.5,
-          color: 'var(--surface-400)',
-          letterSpacing: '0.02em',
+          fontSize: 9.5,
+          color: 'var(--surface-500)',
+          letterSpacing: '0.04em',
+          textTransform: 'uppercase',
         }}
       >
         {obj.kind} · {(obj.fields || []).length}f · {obj.sample}s
