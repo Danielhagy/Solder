@@ -204,6 +204,126 @@ _MIGRATIONS: list[tuple[str, str]] = [
             "AND m.created_at > m2.created_at"
         ),
     ),
+    # ── Soft-delete tracking on integrations ──
+    # `deleted_at` records WHEN the soft-delete happened so the frontend
+    # can render "deleted X ago" and the purge cron can hard-delete rows
+    # past the 30-day TTL. Idempotent: IF NOT EXISTS keeps multi-restart
+    # boots clean.
+    (
+        "add_integrations_deleted_at",
+        "ALTER TABLE integrations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    ),
+    # ── Sandboxes v1: per-connection sandbox configuration ──
+    # The integration→connector keying for mock-engine state is being
+    # replaced by per-connection. v1 is additive: `connection_id` lands
+    # nullable on `mock_specs` and `test_banks` alongside the existing
+    # `integration_id`. Task #2 (route migration) flips reads/writes onto
+    # `connection_id`; a later cleanup migration drops `integration_id`.
+    #
+    # `connections.sandbox_mode` discriminates how this connection is
+    # served at sandbox-env time: 'none' (no sandbox configured),
+    # 'vendor' (use vendor sandbox creds — base_url + secrets in
+    # `sandbox_config` override prod), 'synthetic' (mock-engine serves
+    # synthesised data, primed from OpenAPI + active probe + observed
+    # traffic). `sandbox_config` carries the per-mode payload (vendor
+    # sandbox base_url/credentials, KB opt-in flag, last-prime timestamp,
+    # endpoint coverage stats).
+    (
+        "add_connections_sandbox_mode",
+        (
+            "ALTER TABLE IF EXISTS connections "
+            "ADD COLUMN IF NOT EXISTS sandbox_mode VARCHAR(16) "
+            "NOT NULL DEFAULT 'none'"
+        ),
+    ),
+    (
+        "add_connections_sandbox_config",
+        (
+            "ALTER TABLE IF EXISTS connections "
+            "ADD COLUMN IF NOT EXISTS sandbox_config JSONB "
+            "NOT NULL DEFAULT '{}'::jsonb"
+        ),
+    ),
+    (
+        "add_mock_specs_connection_id",
+        (
+            "ALTER TABLE IF EXISTS mock_specs "
+            "ADD COLUMN IF NOT EXISTS connection_id UUID "
+            "REFERENCES connections(id)"
+        ),
+    ),
+    (
+        "add_mock_specs_connection_id_index",
+        (
+            "CREATE INDEX IF NOT EXISTS ix_mock_specs_connection_id "
+            "ON mock_specs(connection_id)"
+        ),
+    ),
+    (
+        "add_test_banks_connection_id",
+        (
+            "ALTER TABLE IF EXISTS test_banks "
+            "ADD COLUMN IF NOT EXISTS connection_id UUID "
+            "REFERENCES connections(id)"
+        ),
+    ),
+    (
+        "add_test_banks_connection_id_index",
+        (
+            "CREATE INDEX IF NOT EXISTS ix_test_banks_connection_id "
+            "ON test_banks(connection_id)"
+        ),
+    ),
+    # Drop NOT NULL on the legacy integration_id columns so new code
+    # paths can persist with `connection_id` alone. Cleanup migration
+    # will drop these columns entirely once all callers move.
+    (
+        "mock_specs_integration_id_nullable",
+        "ALTER TABLE IF EXISTS mock_specs ALTER COLUMN integration_id DROP NOT NULL",
+    ),
+    (
+        "test_banks_integration_id_nullable",
+        "ALTER TABLE IF EXISTS test_banks ALTER COLUMN integration_id DROP NOT NULL",
+    ),
+    # ── Process Diagram editor (Phase 1) ──
+    # Backfills the columns the new ProcessDiagram-aware code paths read.
+    # `create_all` only adds missing TABLES, not missing COLUMNS, so these
+    # ALTER statements are mandatory on any non-fresh DB.
+    (
+        "openapi_specs_entity_schemas",
+        (
+            "ALTER TABLE IF EXISTS openapi_specs "
+            "ADD COLUMN IF NOT EXISTS entity_schemas JSONB NOT NULL DEFAULT '{}'::jsonb"
+        ),
+    ),
+    (
+        "connections_openapi_spec_id",
+        (
+            "ALTER TABLE IF EXISTS connections "
+            "ADD COLUMN IF NOT EXISTS openapi_spec_id UUID REFERENCES openapi_specs(id)"
+        ),
+    ),
+    (
+        "connections_openapi_spec_id_index",
+        (
+            "CREATE INDEX IF NOT EXISTS ix_connections_openapi_spec_id "
+            "ON connections(openapi_spec_id)"
+        ),
+    ),
+    (
+        "integrations_next_run_at",
+        (
+            "ALTER TABLE IF EXISTS integrations "
+            "ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMP WITH TIME ZONE"
+        ),
+    ),
+    (
+        "integrations_next_run_at_index",
+        (
+            "CREATE INDEX IF NOT EXISTS ix_integrations_next_run_at "
+            "ON integrations(next_run_at)"
+        ),
+    ),
 ]
 
 

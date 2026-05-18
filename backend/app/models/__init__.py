@@ -13,6 +13,7 @@ from app.models.mock_engine import (
     MockSpec,
     RunAuditEvent,
 )
+from app.models.process_diagram import ProcessDiagram
 from app.models.test_bank import TestBank, TestBankEntity
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "MockSession",
     "MockSessionWrite",
     "RunAuditEvent",
+    "ProcessDiagram",
     "TestBank",
     "TestBankEntity",
 ]

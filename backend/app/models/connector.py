@@ -112,6 +112,42 @@ class Connection(Base, TimestampMixin):
     # Nonce / IV for the AEAD cipher. Stored alongside ciphertext.
     nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
+    # ── Sandboxes v1 ──────────────────────────────────────────────────
+    # How this connection is served when an integration runs in
+    # `environment='sandbox'`:
+    #   'none'      — no sandbox configured; sandbox runs against this
+    #                 connection error out until the user picks a mode.
+    #   'vendor'    — use vendor sandbox credentials in `sandbox_config`
+    #                 (base_url + encrypted secrets) instead of prod.
+    #                 The mock-engine is bypassed.
+    #   'synthetic' — mock-engine serves data primed from OpenAPI specs,
+    #                 a read-only active probe of the prod creds, and
+    #                 ongoing passive observation of prod traffic.
+    sandbox_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="none",
+        server_default=text("'none'"),
+    )
+    # Per-mode payload. For 'vendor': {base_url, ciphertext, nonce}
+    # for the sandbox creds. For 'synthetic': priming state, KB opt-in
+    # flag, endpoint coverage stats, last-primed timestamp.
+    sandbox_config: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    # Custom (Oro / Sage stub) Connections that don't have a registered
+    # Connector reference a hand-authored OpenAPISpec so the process-
+    # diagram editor can populate object pickers + the deep-extraction
+    # loader can populate TestBank rows from the spec. Built-in
+    # Connections leave this null (the Connector's bundled spec is
+    # resolved separately via REGISTRY).
+    openapi_spec_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("openapi_specs.id"),
+        nullable=True,
+        index=True,
+    )
+
     connector: Mapped[Optional["Connector"]] = relationship(
         back_populates="connections"
     )

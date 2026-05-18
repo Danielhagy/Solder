@@ -448,7 +448,174 @@ export const api = {
       output?: unknown;
       note?: string | null;
     }>(`/nodes/output?${qs.toString()}`);
-  }
+  },
+
+  // ── Process Diagrams (workflow builder) ──
+  listDiagrams: () =>
+    request<
+      Array<{
+        id: string;
+        name: string;
+        description: string | null;
+        document: Record<string, unknown>;
+        integration_id: string | null;
+        last_generated_at: string | null;
+        last_generated_doc_hash: string | null;
+        created_at: string;
+        updated_at: string;
+      }>
+    >('/process-diagrams'),
+  getDiagram: (id: string) =>
+    request<{
+      id: string;
+      name: string;
+      description: string | null;
+      document: Record<string, unknown>;
+      integration_id: string | null;
+      last_generated_at: string | null;
+      last_generated_doc_hash: string | null;
+      created_at: string;
+      updated_at: string;
+    }>(`/process-diagrams/${encodeURIComponent(id)}`),
+  createDiagram: (data: {
+    name: string;
+    description?: string | null;
+    document?: Record<string, unknown>;
+    integration_id?: string | null;
+  }) =>
+    request<{
+      id: string;
+      name: string;
+      description: string | null;
+      document: Record<string, unknown>;
+      integration_id: string | null;
+      created_at: string;
+      updated_at: string;
+    }>('/process-diagrams', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateDiagram: (
+    id: string,
+    data: {
+      name?: string;
+      description?: string | null;
+      document?: Record<string, unknown>;
+      integration_id?: string | null;
+    }
+  ) =>
+    request<{
+      id: string;
+      document: Record<string, unknown>;
+      integration_id: string | null;
+      updated_at: string;
+    }>(`/process-diagrams/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  deleteDiagram: (id: string) =>
+    request<null>(`/process-diagrams/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  generateIntegrationFromDiagram: (
+    id: string,
+    data?: { target_integration_id?: string | null; force?: boolean }
+  ) =>
+    request<{
+      integration_id: string;
+      nodes_count: number;
+      warnings: Array<{ kind: string; message: string }>;
+      preview_config: { nodes: unknown[]; variables: Record<string, unknown> };
+    }>(`/process-diagrams/${encodeURIComponent(id)}/generate`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+  runGapFinder: (id: string, opts?: { demoReplay?: boolean; regenerate?: boolean }) => {
+    const qs = new URLSearchParams();
+    if (opts?.demoReplay) qs.set('demo_replay', 'true');
+    if (opts?.regenerate) qs.set('regenerate', 'true');
+    const tail = qs.toString();
+    return request<{
+      questions: Array<{ tag: string; q: string }>;
+      cached: boolean;
+      source: 'live' | 'cache' | 'fallback';
+    }>(`/process-diagrams/${encodeURIComponent(id)}/gap-finder${tail ? '?' + tail : ''}`, {
+      method: 'POST',
+    });
+  },
+  suggestEdgeMappings: (
+    id: string,
+    edgeId: string,
+    data?: {
+      source_object_id?: string;
+      target_object_id?: string;
+      edge_action?: string;
+      extra_context?: string;
+    },
+    opts?: { demoReplay?: boolean }
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.demoReplay) qs.set('demo_replay', 'true');
+    const tail = qs.toString();
+    return request<{
+      mappings: Array<{
+        target_path: string;
+        source_expression: string;
+        confidence: number;
+        rationale: string;
+        needs_review: boolean;
+      }>;
+      cached: boolean;
+      source: 'live' | 'cache' | 'fallback';
+    }>(
+      `/process-diagrams/${encodeURIComponent(id)}/edges/${encodeURIComponent(edgeId)}/suggest-mappings${
+        tail ? '?' + tail : ''
+      }`,
+      { method: 'POST', body: JSON.stringify(data || {}) }
+    );
+  },
+
+  // ── Test banks (process-diagram object pickers + Sandboxes Records tab) ──
+  listBankEntities: (connectionId: string, entityType?: string, limit = 5) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (entityType) qs.set('entity_type', entityType);
+    return request<{
+      entities: Array<{
+        id: string;
+        entity_type: string;
+        entity_id: string | null;
+        data: Record<string, unknown>;
+        is_golden: boolean;
+        references: Record<string, unknown>;
+      }>;
+      entity_type: string | null;
+      total: number;
+    }>(`/test-banks/by-connection/${encodeURIComponent(connectionId)}/entities?${qs.toString()}`);
+  },
+  synthesizeBankEntities: (
+    connectionId: string,
+    data: { entity_type: string; count?: number; variant?: string }
+  ) =>
+    request<{
+      created: number;
+      used_fallback: boolean;
+      error: string | null;
+      examples: Record<string, unknown>[];
+    }>(`/test-banks/by-connection/${encodeURIComponent(connectionId)}/entities/synthesize`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  deepReseedConnection: (connectionId: string) =>
+    request<{
+      entities_seeded: number;
+      examples_collected: number;
+      enums_extracted: number;
+      formats_extracted: number;
+      refs_resolved: number;
+      error_shapes_captured: number;
+    }>(`/test-banks/by-connection/${encodeURIComponent(connectionId)}/sandbox/deep-reseed`, {
+      method: 'POST',
+    })
 };
 
 /** Brandfetch CDN URL for a connector's logo. Falls back to null when the

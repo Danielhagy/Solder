@@ -1,4 +1,4 @@
-from app.schemas.connection import ConnectionIn, ConnectionOut
+from app.schemas.connection import ConnectionIn, ConnectionOut, ConnectionSandboxIn
 from app.schemas.connector import ConnectorOut, DiscoverableEndpoint
 from app.schemas.integration import (
     AILearningCreate,
@@ -12,6 +12,16 @@ from app.schemas.integration import (
     RunCreate,
     RunResponse,
     RunUpdate,
+)
+from app.schemas.process_diagram import (
+    GapFinderResponse,
+    GenerateRequest,
+    GenerateResponse,
+    ProcessDiagramCreate,
+    ProcessDiagramOut,
+    ProcessDiagramUpdate,
+    SuggestMappingsRequest,
+    SuggestMappingsResponse,
 )
 
 __all__ = [
@@ -30,4 +40,13 @@ __all__ = [
     "DiscoverableEndpoint",
     "ConnectionIn",
     "ConnectionOut",
+    "ConnectionSandboxIn",
+    "ProcessDiagramCreate",
+    "ProcessDiagramUpdate",
+    "ProcessDiagramOut",
+    "GenerateRequest",
+    "GenerateResponse",
+    "GapFinderResponse",
+    "SuggestMappingsRequest",
+    "SuggestMappingsResponse",
 ]

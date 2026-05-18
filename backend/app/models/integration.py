@@ -78,6 +78,20 @@ class Integration(Base, TimestampMixin):
     mock_spec_id: Mapped[Optional[str]] = mapped_column(
         UUID(as_uuid=False), ForeignKey("mock_specs.id"), nullable=True
     )
+    # Next scheduled fire time for `trigger.type == 'schedule'` integrations.
+    # The polling executor (Phase 2) reads this; Phase 1 emits it via the
+    # diagram compiler so the data is captured even though nothing reads it.
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, index=True
+    )
+    # Soft-delete marker. Set by the DELETE handler; null on live rows. The
+    # purge cron (app/services/purge_deleted.py) hard-deletes any row whose
+    # `deleted_at` is older than 30 days AND has no Run rows referencing it
+    # (the Run.integration_id FK is non-nullable, so cascading would orphan
+    # run history). Frontend can render "deleted X days ago" off this column.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
     # Relationships
     runs: Mapped[list["Run"]] = relationship(back_populates="integration")
@@ -101,6 +115,23 @@ class OpenAPISpec(Base, TimestampMixin):
     parsed_markdown: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     integration_id: Mapped[Optional[str]] = mapped_column(
         UUID(as_uuid=False), ForeignKey("integrations.id"), nullable=True
+    )
+    # Pre-resolved per-entity schemas + create/list paths, populated by
+    # `services/entity_resolver.py` (called from `openapi_ingest` on save).
+    # Shape:
+    #   { "<entity_type>": {
+    #       "jsonSchema": {<deref'd JSON Schema>},
+    #       "samplePath": "/developer/v1/purchase-orders",
+    #       "createPath": "/developer/v1/purchase-orders",
+    #       "enums": {"<field_path>": ["VAL1","VAL2"]},
+    #       "formats": {"<field_path>": "date-time"},
+    #       "required": ["id", "vendor_id", ...],
+    #       "refs": {"<field_path>": "<entity_type>"}
+    #     }, ... }
+    # Avoids resolving $refs on every editor click; drives the diagram
+    # editor's object pickers + the AI mapper's nested-schema prompts.
+    entity_schemas: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
 
     # Relationships

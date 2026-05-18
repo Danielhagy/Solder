@@ -11,6 +11,8 @@ if _sys.platform == "win32":
 
     _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -25,13 +27,46 @@ from app.api import (
     integrations,
     nodes,
     openapi,
+    process_diagrams,
     runs,
+    test_banks,
 )
 from app.config import settings
-from app.database import engine
+from app.database import async_session, engine
 from app.database_migrations import run_dev_migrations
 from app.mock_engine.router import router as mock_engine_router
 from app.models import Base
+from app.services.purge_deleted import purge_old_deleted_integrations
+
+logger = logging.getLogger(__name__)
+
+# How often the purge loop wakes up. Six hours is plenty: the TTL is 30 days,
+# so even if a tick is missed (process restart) the next one catches up.
+_PURGE_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+async def _purge_loop() -> None:
+    """Periodic background task: hard-delete soft-deleted integrations.
+
+    Runs forever in the FastAPI process; cancelled in lifespan teardown.
+    Each tick opens its own session so a long-lived connection isn't held
+    between sleeps. Errors are caught and logged so a transient DB blip
+    doesn't kill the loop.
+    """
+    while True:
+        try:
+            async with async_session() as db:
+                purged = await purge_old_deleted_integrations(db)
+                if purged > 0:
+                    logger.info(
+                        "purged %d integrations soft-deleted >= 30 days ago",
+                        purged,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("purge_deleted_integrations failed; will retry")
+        await asyncio.sleep(_PURGE_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
@@ -43,13 +78,27 @@ async def lifespan(app: FastAPI):
     (adds `integration_connection_id` FKs that depend on the new
     `integration_connections` table create_all just made). Both passes
     are idempotent.
+
+    After schema is ready, launches the purge cron as an asyncio task.
+    The task is cancelled on shutdown so uvicorn can exit cleanly.
     """
     await run_dev_migrations(engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await run_dev_migrations(engine)
-    yield
-    await engine.dispose()
+
+    purge_task = asyncio.create_task(_purge_loop(), name="purge_deleted_integrations")
+    try:
+        yield
+    finally:
+        purge_task.cancel()
+        try:
+            await purge_task
+        except (asyncio.CancelledError, Exception):
+            # Cancellation is expected; any other exception was already
+            # logged inside the loop. Don't let teardown raise.
+            pass
+        await engine.dispose()
 
 
 app = FastAPI(
@@ -82,6 +131,12 @@ app.include_router(
     prefix="/api/connection-types",
     tags=["Connection Types"],
 )
+app.include_router(
+    process_diagrams.router,
+    prefix="/api/process-diagrams",
+    tags=["Process Diagrams"],
+)
+app.include_router(test_banks.router, prefix="/api/test-banks", tags=["Test Banks"])
 app.include_router(dev.router, prefix="/api/dev", tags=["Dev"])
 
 
